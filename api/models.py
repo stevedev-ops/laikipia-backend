@@ -21,6 +21,7 @@ class MemberManager(BaseUserManager):
         return self.create_user(national_id, full_name, phone, password, **extra_fields)
 
 class Member(AbstractBaseUser, PermissionsMixin):
+    uuid = models.UUIDField(default=uuid.uuid4, editable=False, unique=True, db_index=True)
     full_name = models.CharField(max_length=255)
     phone = models.CharField(max_length=20, unique=True)
     national_id = models.CharField(max_length=20, unique=True)
@@ -51,12 +52,35 @@ class Member(AbstractBaseUser, PermissionsMixin):
     security_rank = models.CharField(max_length=50, choices=SECURITY_RANKS, default='none')
     is_security_only = models.BooleanField(default=False)  # If True, locked out of campaign features
     is_active = models.BooleanField(default=True)
+    is_opted_out = models.BooleanField(default=False)  # Right to Erasure / Unsubscribe per Kenya DPA 2019
+    opted_out_at = models.DateTimeField(null=True, blank=True)
     is_voter_verified = models.BooleanField(default=False)
     has_voted = models.BooleanField(default=False)  # Election-day GOTV strike-off
     
     # Voter Sentiment
     supporter_score = models.IntegerField(null=True, blank=True) # 1-5 scale
     top_issue = models.CharField(max_length=255, null=True, blank=True)
+
+    # Recruitment Source & Volunteer Role
+    SOURCE_CHOICES = [
+        ('field_mobilizer', 'Field Mobilizer'),
+        ('social_media', 'Social Media'),
+        ('tiktok', 'TikTok'),
+        ('whatsapp', 'WhatsApp'),
+        ('facebook', 'Facebook'),
+        ('x_twitter', 'X / Twitter'),
+        ('website', 'Website'),
+    ]
+    source = models.CharField(max_length=50, choices=SOURCE_CHOICES, default='field_mobilizer')
+    VOLUNTEER_ROLES = [
+        ('digital_champion', 'Digital Champion'),
+        ('election_volunteer', 'Election Day Volunteer'),
+        ('boda_transport', 'Boda-Boda Transport'),
+        ('general_supporter', 'General Supporter'),
+        ('custom', 'Other / Custom'),
+    ]
+    volunteer_role = models.CharField(max_length=50, choices=VOLUNTEER_ROLES, blank=True, null=True)
+    custom_role = models.CharField(max_length=255, blank=True, null=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -67,7 +91,7 @@ class Member(AbstractBaseUser, PermissionsMixin):
 
     @property
     def referral_code(self):
-        return str(self.id)
+        return str(self.uuid)
 
     def __str__(self):
         return self.full_name
@@ -145,6 +169,10 @@ class PollingAgent(models.Model):
     polling_station = models.CharField(max_length=255)
     checked_in = models.BooleanField(default=False)
     check_in_time = models.DateTimeField(null=True, blank=True)
+    breakfast_received = models.BooleanField(default=False)
+    breakfast_received_at = models.DateTimeField(null=True, blank=True)
+    lunch_received = models.BooleanField(default=False)
+    lunch_received_at = models.DateTimeField(null=True, blank=True)
     notes = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -325,3 +353,119 @@ class SecurityLog(models.Model):
 
     def __str__(self):
         return f"{self.get_status_display()} at {self.polling_station} by {self.guard.full_name}"
+
+
+# ─── Governor Campaign Diary & Chama Functions ──────────────────────────────
+class CampaignFunction(models.Model):
+    EVENT_TYPES = [
+        ('chama', 'Chama / Table Banking Meeting'),
+        ('church', 'Church Service / Harambee'),
+        ('funeral', 'Funeral / Burial'),
+        ('youth', 'Youth / Sports Tournament'),
+        ('women', 'Women Group Baraza'),
+        ('market', 'Market Baraza / Townhall'),
+        ('rally', 'Major Campaign Rally'),
+        ('other', 'Community Function'),
+    ]
+
+    STATUS_CHOICES = [
+        ('pending', 'Pending Secretariat Review'),
+        ('attending', 'Governor Attending in Person'),
+        ('delegated', 'Sending Representative / Delegate'),
+        ('declined', 'Declined / Regrets Sent'),
+    ]
+
+    CONSTITUENCY_CHOICES = [
+        ('Laikipia East', 'Laikipia East'),
+        ('Laikipia West', 'Laikipia West'),
+        ('Laikipia North', 'Laikipia North'),
+    ]
+
+    title = models.CharField(max_length=255)
+    event_type = models.CharField(max_length=50, choices=EVENT_TYPES, default='chama')
+    constituency = models.CharField(max_length=100, choices=CONSTITUENCY_CHOICES, default='Laikipia West')
+    ward = models.CharField(max_length=100, blank=True, null=True)
+    venue = models.CharField(max_length=255)
+    event_date = models.DateField()
+    start_time = models.CharField(max_length=50, default='10:00 AM')
+    
+    # Community Contact Person
+    contact_person_name = models.CharField(max_length=255)
+    contact_person_phone = models.CharField(max_length=20)
+    expected_attendance = models.IntegerField(default=50)
+    description = models.TextField(blank=True, null=True)
+    
+    # Submitted by (Mobilizer or Governor)
+    submitted_by = models.ForeignKey(Member, on_delete=models.SET_NULL, null=True, blank=True, related_name='functions_submitted')
+    is_created_by_governor = models.BooleanField(default=False)
+
+    # Governor RSVP & Delegation
+    status = models.CharField(max_length=50, choices=STATUS_CHOICES, default='pending')
+    delegate_name = models.CharField(max_length=255, blank=True, null=True)
+    delegate_phone = models.CharField(max_length=20, blank=True, null=True)
+    admin_notes = models.TextField(blank=True, null=True)
+    
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['event_date', 'start_time']
+
+    def __str__(self):
+        return f"{self.title} ({self.event_date}) - {self.get_status_display()}"
+
+class CampaignConfig(models.Model):
+    key = models.CharField(max_length=100, unique=True, db_index=True)
+    value = models.TextField(blank=True, default='')
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.key}: {self.value}"
+
+
+
+class AuditLog(models.Model):
+    timestamp = models.DateTimeField(auto_now_add=True, db_index=True)
+    user = models.ForeignKey(Member, on_delete=models.SET_NULL, null=True, blank=True, related_name='audit_logs')
+    action = models.CharField(max_length=100, db_index=True)
+    ip_address = models.CharField(max_length=50, blank=True, null=True)
+    user_agent = models.CharField(max_length=500, blank=True, null=True)
+    details = models.JSONField(default=dict, blank=True)
+    previous_hash = models.CharField(max_length=64, blank=True, default='GENESIS_BLOCK')
+    entry_hash = models.CharField(max_length=64, blank=True, db_index=True)
+
+    class Meta:
+        ordering = ['-id']
+
+    def __str__(self):
+        return f"[{self.timestamp.strftime('%Y-%m-%d %H:%M')}] {self.action} by {self.user.full_name if self.user else 'Anon'}"
+
+    @classmethod
+    def log(cls, action, user=None, request=None, details=None):
+        import hashlib, json
+        details = details or {}
+        ip = "127.0.0.1"
+        ua = ""
+        if request:
+            from api.security import get_client_ip
+            ip = get_client_ip(request)
+            ua = request.META.get('HTTP_USER_AGENT', '')
+            if not user and getattr(request, 'user', None) and request.user.is_authenticated:
+                user = request.user
+
+        last_entry = cls.objects.order_by('-id').first()
+        prev_hash = last_entry.entry_hash if last_entry and last_entry.entry_hash else "GENESIS_BLOCK"
+
+        entry = cls.objects.create(
+            action=action,
+            user=user,
+            ip_address=ip,
+            user_agent=ua[:500] if ua else '',
+            details=details,
+            previous_hash=prev_hash
+        )
+
+        data_string = f"{entry.id}:{entry.timestamp.isoformat()}:{user.id if user else 'ANON'}:{action}:{json.dumps(details, sort_keys=True)}:{prev_hash}"
+        entry.entry_hash = hashlib.sha256(data_string.encode('utf-8')).hexdigest()
+        entry.save(update_fields=['entry_hash'])
+        return entry

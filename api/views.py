@@ -1,12 +1,21 @@
+import csv
+from django.http import HttpResponse
+from django.utils import timezone
+import json
+import uuid
 from rest_framework.decorators import api_view, permission_classes
 
-from django.utils import timezone
 from datetime import timedelta
 from rest_framework import status, views, response, generics
 from rest_framework.pagination import PageNumberPagination
 from django.db.models import Count, Q
-from .models import Member, Invite, VoterRecord, CanvassAssignment, TransportRequest, PollingAgent, TallyRecord, IncidentReport, PhoneBankTarget, CallRecord, EmergencyBroadcast, SecurityLog
-from .serializers import MemberSerializer, InviteSerializer, VoterRecordSerializer, EventSerializer, EmergencyBroadcastSerializer
+from .models import (
+    Member, Invite, CampaignConfig, AuditLog, VoterRecord, CanvassAssignment, 
+    TransportRequest, PollingAgent, TallyRecord, IncidentReport, PhoneBankTarget, 
+    CallRecord, EmergencyBroadcast, SecurityLog
+)
+from .security import check_rate_limit, check_honeypot, get_client_ip, rate_limit
+from .serializers import MemberSerializer, CampaignConfigSerializer, InviteSerializer, VoterRecordSerializer, EventSerializer, EmergencyBroadcastSerializer
 
 from rest_framework.authtoken.models import Token
 from rest_framework.permissions import AllowAny, IsAuthenticated, IsAdminUser
@@ -49,8 +58,24 @@ class MemberLoginView(views.APIView):
     permission_classes = [AllowAny]
     throttle_classes = [LoginThrottle]
     def post(self, request):
-        first_name = request.data.get('firstName', '').strip()
-        national_id = request.data.get('nationalId', '').strip()
+        # Sliding-window rate limit
+        allowed, remaining, retry_after = check_rate_limit(request, 'login', max_requests=5, window_seconds=300)
+        if not allowed:
+            AuditLog.log('LOGIN_RATE_LIMITED', request=request)
+            return response.Response({
+                "error": "rate_limit_exceeded",
+                "message": f"Too many failed login attempts. Please wait {retry_after} seconds before trying again.",
+                "retry_after": retry_after
+            }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={"Retry-After": str(retry_after)})
+
+        data = request.data
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except Exception:
+                data = {}
+        first_name = (data.get('firstName') or data.get('first_name') or '').strip()
+        national_id = (data.get('nationalId') or data.get('national_id') or '').strip()
 
         if not first_name or not national_id:
             return response.Response(
@@ -64,6 +89,7 @@ class MemberLoginView(views.APIView):
         ).first()
 
         if not member:
+            AuditLog.log('LOGIN_FAILED', request=request, details={'national_id': national_id, 'first_name': first_name})
             return response.Response(
                 {"error": "No member found with that First Name and ID combination."},
                 status=status.HTTP_401_UNAUTHORIZED
@@ -75,26 +101,74 @@ class MemberLoginView(views.APIView):
                 status=status.HTTP_404_NOT_FOUND
             )
 
-        # Security personnel can bypass the voter registry requirement
-        is_security = member.is_security_only or member.security_rank
-        if not member.is_voter_verified and not member.is_admin and not is_security:
-            return response.Response(
-                {"error": "You must be a registered and verified voter to log in."},
-                status=status.HTTP_403_FORBIDDEN
-            )
+        # All active registered members can log in
 
         token, _ = Token.objects.get_or_create(user=member)
+        AuditLog.log('LOGIN_SUCCESS', user=member, request=request)
         return response.Response({
             "token": token.key,
-            "member": MemberSerializer(member).data
+            "member": MemberSerializer(member, context={'request': request}).data
         })
 
 class MemberRegisterView(views.APIView):
     permission_classes = [AllowAny]
     def post(self, request):
+        # 1. Anti-Bot Honeypot Trap
+        if check_honeypot(request):
+            AuditLog.log('BOT_TRAPPED', request=request, details={'fields': list((request.data or {}).keys())})
+            # Silently accept to mislead automated bot scrapers
+            return response.Response({
+                "success": True,
+                "message": "Registration received and queued for review."
+            }, status=status.HTTP_200_OK)
+
+        # 2. Rate Limit (15 per minute per IP)
+        allowed, remaining, retry_after = check_rate_limit(request, 'register', max_requests=15, window_seconds=60)
+        if not allowed:
+            return response.Response({
+                "error": "rate_limit_exceeded",
+                "message": f"Registration request limit reached. Please wait {retry_after} seconds before trying again.",
+                "retry_after": retry_after
+            }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={"Retry-After": str(retry_after)})
+
         data = request.data.copy()
-        referrer_id = data.get('referred_by')
+        referrer_raw = data.get('referred_by')
         invite_token = data.get('invite_token')
+
+        # Resolve UUID or legacy ID to internal Foreign Key
+        referrer_id = None
+        if referrer_raw:
+            ref_member = None
+            try:
+                uuid_obj = uuid.UUID(str(referrer_raw))
+                ref_member = Member.objects.filter(uuid=uuid_obj).first()
+            except (ValueError, AttributeError):
+                pass
+            if not ref_member and str(referrer_raw).isdigit():
+                ref_member = Member.objects.filter(pk=int(referrer_raw)).first()
+            if ref_member:
+                referrer_id = ref_member.id
+        # If social source and no explicit referrer, keep referred_by as None
+        raw_source = str(data.get('source', 'field_mobilizer')).strip().lower()
+        if raw_source in ['x', 'twitter', 'x_twitter']:
+            source_val = 'x_twitter'
+        elif raw_source in ['wa', 'whatsapp']:
+            source_val = 'whatsapp'
+        elif raw_source in ['tt', 'tiktok']:
+            source_val = 'tiktok'
+        elif raw_source in ['fb', 'facebook']:
+            source_val = 'facebook'
+        elif raw_source in ['web', 'website']:
+            source_val = 'website'
+        elif raw_source in ['social', 'social_media']:
+            source_val = 'social_media'
+        else:
+            source_val = raw_source or 'field_mobilizer'
+
+        data['source'] = source_val
+        if source_val != 'field_mobilizer' and not referrer_raw:
+            referrer_id = None
+        data['referred_by'] = referrer_id
         
         # SECURITY FIX: Force is_admin to False for all public registrations
         data['is_admin'] = False
@@ -115,12 +189,19 @@ class MemberRegisterView(views.APIView):
             except Member.DoesNotExist:
                 return response.Response({"error": "Invalid referrer."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # 2. Duplicate Check
-        if Member.objects.filter(Q(phone=data.get('phone')) | Q(national_id=data.get('national_id'))).exists():
-            return response.Response(
-                {"error": "Phone or ID already registered."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        # 2. Duplicate Check with rich response for lockout & mobilizer claim
+        existing_member = Member.objects.filter(Q(phone=data.get('phone')) | Q(national_id=data.get('national_id'))).first()
+        if existing_member:
+            return response.Response({
+                "error": "already_registered",
+                "message": "Phone Number or National ID already registered in DCP Laikipia.",
+                "member_name": existing_member.full_name,
+                "has_referrer": existing_member.referred_by is not None,
+                "referrer_name": existing_member.referred_by.full_name if existing_member.referred_by else None,
+                "ward": existing_member.ward,
+                "polling_station": existing_member.polling_station,
+                "source": getattr(existing_member, 'source', 'field_mobilizer')
+            }, status=status.HTTP_409_CONFLICT)
 
         # 3. Check Voter Register with enhanced matching FIRST
         national_id = data.get('national_id', '')
@@ -160,12 +241,7 @@ class MemberRegisterView(views.APIView):
                             break
 
         is_security_deployment = data.get('is_security_only', False)
-
-        if not matched_record and not is_security_deployment:
-            return response.Response(
-                {"error": "Re-check your information, you made an error."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        # Any supporter can register whether matched in voter roll or not
 
         # 4. Invite Token Check
         if invite_token:
@@ -213,19 +289,33 @@ class MemberRegisterView(views.APIView):
 class MemberMeView(views.APIView):
     permission_classes = [IsAuthenticated]
     def get(self, request):
-        return response.Response(MemberSerializer(request.user).data)
+        return response.Response(MemberSerializer(request.user, context={'request': request}).data)
 
 class MemberPublicView(views.APIView):
     permission_classes = [AllowAny]
-    def get(self, request, pk):
-        try:
-            member = Member.objects.get(pk=pk)
-            return response.Response({
-                "id": member.id,
-                "full_name": member.full_name
-            })
-        except Member.DoesNotExist:
+    def get(self, request, identifier=None, pk=None, **kwargs):
+        target = identifier or pk or kwargs.get('identifier') or kwargs.get('pk')
+        member = None
+        if target:
+            try:
+                uuid_obj = uuid.UUID(str(target))
+                member = Member.objects.filter(uuid=uuid_obj).first()
+            except (ValueError, AttributeError):
+                pass
+            if not member and str(target).isdigit():
+                member = Member.objects.filter(pk=int(target)).first()
+
+        if not member:
             return response.Response({"error": "Member not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        return response.Response({
+            "id": str(member.uuid),
+            "full_name": member.full_name,
+            "ward": member.ward,
+            "polling_station": member.polling_station,
+            "recruits_count": member.recruits.count(),
+            "referral_code": str(member.uuid)
+        })
 
 class MemberInsightsView(views.APIView):
     permission_classes = [IsAuthenticated]
@@ -242,7 +332,7 @@ class MemberInsightsView(views.APIView):
         lineage = []
         curr = member
         while curr:
-            lineage.insert(0, MemberSerializer(curr).data)
+            lineage.insert(0, MemberSerializer(curr, context={'request': request}).data)
             curr = curr.referred_by
             if len(lineage) > 10: break # Safety break
 
@@ -270,9 +360,36 @@ class MemberListView(generics.ListCreateAPIView):
         referred_by = self.request.query_params.get('referred_by')
         if referred_by:
             if referred_by == 'null':
-                queryset = queryset.filter(referred_by__isnull=True)
+                # Root mobilizers MUST be field mobilizers, NEVER online/social media signups
+                queryset = queryset.filter(referred_by__isnull=True, source='field_mobilizer')
             else:
                 queryset = queryset.filter(referred_by=referred_by)
+
+        is_digital = self.request.query_params.get('is_digital')
+        if is_digital == 'true':
+            queryset = queryset.exclude(source='field_mobilizer')
+        elif is_digital == 'false':
+            queryset = queryset.filter(source='field_mobilizer')
+
+        ward = self.request.query_params.get('ward')
+        if ward and ward.strip() and ward.strip().lower() != 'all':
+            queryset = queryset.filter(Q(ward__iexact=ward.strip()) | Q(official_ward__iexact=ward.strip()))
+
+        source = self.request.query_params.get('source')
+        if source and source.strip() and source.strip().lower() != 'all':
+            s_val = source.strip().lower()
+            if s_val in ['x', 'twitter', 'x_twitter']:
+                queryset = queryset.filter(Q(source='x_twitter') | Q(source='x') | Q(source='twitter'))
+            elif s_val in ['social', 'social_media', 'social_link', 'web', 'website']:
+                queryset = queryset.filter(Q(source='social_media') | Q(source='social') | Q(source='website') | Q(source='web'))
+            elif s_val in ['wa', 'whatsapp']:
+                queryset = queryset.filter(Q(source='whatsapp') | Q(source='wa'))
+            elif s_val in ['tt', 'tiktok']:
+                queryset = queryset.filter(Q(source='tiktok') | Q(source='tt'))
+            elif s_val in ['fb', 'facebook']:
+                queryset = queryset.filter(Q(source='facebook') | Q(source='fb'))
+            else:
+                queryset = queryset.filter(source__iexact=s_val)
 
         # ALWAYS filter out admins and staff from the public member lists
         queryset = queryset.filter(is_admin=False, is_staff=False)
@@ -306,13 +423,136 @@ class MemberListView(generics.ListCreateAPIView):
             queryset = queryset.order_by('is_voter_verified', '-id')
             
         return queryset
+class MemberExportCsvView(views.APIView):
+    """
+    Exports a clean CSV file with Name, Phone, Ward, Station, Source, Volunteer Role
+    specifically formatted for calling or bulk SMS broadcasting.
+    Supports filtering by ward, source, voter status, search, and referred_by.
+    """
+    permission_classes = [IsAdminUser]
+
+    def get(self, request):
+        allowed, remaining, retry_after = check_rate_limit(request, 'export_csv', max_requests=25, window_seconds=3600, extra_key=str(request.user.id))
+        if not allowed:
+            return response.Response({
+                "error": "rate_limit_exceeded",
+                "message": f"CSV export rate limit reached. Please wait {retry_after} seconds before requesting another export.",
+                "retry_after": retry_after
+            }, status=status.HTTP_429_TOO_MANY_REQUESTS)
+        ward = request.query_params.get('ward', '').strip()
+        source = request.query_params.get('source', '').strip()
+        voter_status = request.query_params.get('voter_status', '').strip()
+        search = request.query_params.get('search', '').strip()
+        referred_by = request.query_params.get('referred_by', '').strip()
+        is_digital = request.query_params.get('is_digital', '').strip()
+
+        qs = Member.objects.filter(is_admin=False, is_staff=False).select_related('referred_by')
+
+        if is_digital == 'true':
+            qs = qs.exclude(source='field_mobilizer')
+        elif is_digital == 'false':
+            qs = qs.filter(source='field_mobilizer')
+
+        if referred_by == 'null':
+            qs = qs.filter(referred_by__isnull=True, source='field_mobilizer')
+        elif referred_by.isdigit():
+            qs = qs.filter(referred_by_id=int(referred_by))
+
+        if ward and ward.lower() != 'all':
+            qs = qs.filter(Q(ward__iexact=ward) | Q(official_ward__iexact=ward))
+
+        if source and source.lower() != 'all':
+            s_val = source.lower()
+            if s_val in ['x', 'twitter', 'x_twitter']:
+                qs = qs.filter(Q(source='x_twitter') | Q(source='x') | Q(source='twitter'))
+            elif s_val in ['social', 'social_media', 'social_link', 'web', 'website']:
+                qs = qs.filter(Q(source='social_media') | Q(source='social') | Q(source='website') | Q(source='web'))
+            elif s_val in ['wa', 'whatsapp']:
+                qs = qs.filter(Q(source='whatsapp') | Q(source='wa'))
+            elif s_val in ['tt', 'tiktok']:
+                qs = qs.filter(Q(source='tiktok') | Q(source='tt'))
+            elif s_val in ['fb', 'facebook']:
+                qs = qs.filter(Q(source='facebook') | Q(source='fb'))
+            else:
+                qs = qs.filter(source__iexact=s_val)
+
+        if search:
+            if search.isdigit():
+                qs = qs.filter(Q(national_id__icontains=search) | Q(phone__icontains=search))
+            else:
+                for part in [p for p in search.split(' ') if p]:
+                    qs = qs.filter(
+                        Q(full_name__icontains=part) | Q(national_id__icontains=part) | Q(phone__icontains=part)
+                    )
+
+        if voter_status == 'verified':
+            qs = qs.filter(is_voter_verified=True)
+        elif voter_status == 'unverified':
+            qs = qs.filter(is_voter_verified=False)
+
+        # Kenya DPA Opt-Out filter (defaults to True: strictly excludes supporters who requested STOP / erasure)
+        exclude_opted_out = request.query_params.get('exclude_opted_out', 'true').strip().lower() != 'false'
+        if exclude_opted_out:
+            qs = qs.filter(is_opted_out=False)
+
+        response_file = HttpResponse(content_type='text/csv; charset=utf-8')
+        ward_label = ward.replace(' ', '_').lower() if ward and ward.lower() != 'all' else 'all_wards'
+        source_label = f"_{source.lower()}" if source and source.lower() != 'all' else ("_all_channels" if is_digital == 'true' else "")
+        filename = f"dcp_members_call_sms{source_label}_{ward_label}_{timezone.now().strftime('%Y%m%d_%H%M')}.csv"
+        response_file['Content-Disposition'] = f'attachment; filename="{filename}"'
+        response_file['Access-Control-Expose-Headers'] = 'Content-Disposition'
+
+        writer = csv.writer(response_file)
+        writer.writerow([
+            'Full Name',
+            'Phone (Call / SMS)',
+            'Ward',
+            'Polling Station / Center',
+            'Recruitment Source',
+            'Volunteer Role',
+            'Custom Skills / Notes',
+            'Assigned Mobilizer',
+            'Verified 2022 Voter',
+            'DPA Consent / Opt-Out Status',
+            'National ID',
+            'Registration Date'
+        ])
+
+        rows_count = 0
+        for m in qs.order_by('ward', 'full_name'):
+            rows_count += 1
+            writer.writerow([
+                m.full_name,
+                m.phone,
+                m.official_ward or m.ward or '',
+                m.official_polling_station or m.polling_station or '',
+                m.source or 'field_mobilizer',
+                (m.volunteer_role or 'general_supporter').replace('_', ' ').title(),
+                m.custom_role or '',
+                m.referred_by.full_name if m.referred_by else 'Root / Direct',
+                'Yes' if m.is_voter_verified else 'No',
+                'Opted Out (DPA Restricted)' if m.is_opted_out else 'Active Consent',
+                m.national_id or '',
+                m.created_at.strftime('%Y-%m-%d %H:%M') if m.created_at else ''
+            ])
+
+        AuditLog.log('CSV_EXPORT', user=request.user, request=request, details={
+            'ward': ward or 'all',
+            'source': source or 'all',
+            'is_digital': is_digital,
+            'rows_exported': rows_count,
+            'filename': filename
+        })
+
+        return response_file
+
 class MemberDetailView(views.APIView):
     permission_classes = [IsAdminUser]
 
     def get(self, request, pk):
         try:
             member = Member.objects.get(pk=pk)
-            return response.Response(MemberSerializer(member).data)
+            return response.Response(MemberSerializer(member, context={'request': request}).data)
         except Member.DoesNotExist:
             return response.Response({"error": "Not found"}, status=status.HTTP_404_NOT_FOUND)
 
@@ -337,7 +577,7 @@ class MemberDetailView(views.APIView):
                     return response.Response({"error": "Referrer not found"}, status=status.HTTP_400_BAD_REQUEST)
 
         member.save()
-        return response.Response(MemberSerializer(member).data)
+        return response.Response(MemberSerializer(member, context={'request': request}).data)
 
 class VoterRecordPagination(PageNumberPagination):
     page_size = 50
@@ -377,7 +617,11 @@ class VoterRecordListView(generics.ListAPIView):
 class ReportStatsView(views.APIView):
     permission_classes = [IsAuthenticated]
     def get(self, request):
-        member_id = request.query_params.get('member_id')
+        if not request.user.is_admin:
+            # Force scoping to mobilizer's own tree
+            member_id = request.user.id
+        else:
+            member_id = request.query_params.get('member_id')
         mode = request.query_params.get('mode', 'all')  # all | verified | unverified
 
         base_qs = Member.objects.filter(is_admin=False, is_staff=False)
@@ -449,6 +693,11 @@ class InviteDetailView(generics.RetrieveAPIView):
     lookup_field = 'id'
 
 class VoterLookupView(views.APIView):
+    """
+    Lookup voter in official IEBC register for self-enrollment and mobilizers.
+    Protected against mass scraping via sliding-window rate limiting,
+    minimum query lengths, and serializer masking for public requests.
+    """
     permission_classes = [AllowAny]
 
     def get(self, request):
@@ -456,12 +705,44 @@ class VoterLookupView(views.APIView):
         if not query:
             return response.Response([])
 
-        # Handle numeric queries (ID/Phone) immediately
+        is_auth = bool(request.user and request.user.is_authenticated)
+
+        # 1. Sliding-window rate limiting (strict for public self-enrollment, relaxed for mobilizers)
+        if not is_auth:
+            allowed, remaining, retry_after = check_rate_limit(
+                request, 'voter_lookup_public', max_requests=8, window_seconds=60
+            )
+            if not allowed:
+                return response.Response({
+                    "error": "rate_limit_exceeded",
+                    "message": f"Too many searches. Please wait {retry_after} seconds before trying again.",
+                    "retry_after": retry_after
+                }, status=status.HTTP_429_TOO_MANY_REQUESTS)
+        else:
+            allowed, remaining, retry_after = check_rate_limit(
+                request, 'voter_lookup_auth', max_requests=60, window_seconds=60
+            )
+            if not allowed:
+                return response.Response({
+                    "error": "rate_limit_exceeded",
+                    "message": "Search limit reached. Please slow down."
+                }, status=status.HTTP_429_TOO_MANY_REQUESTS)
+
+        # 2. Query validation to prevent broad harvesting by bots
+        if not is_auth:
+            # If numeric (National ID or Phone search), require at least 5 digits to block prefix dumping
+            if query.isdigit() and len(query) < 5:
+                return response.Response([])
+            # If name search, require at least 3 characters
+            if not query.isdigit() and len(query) < 3:
+                return response.Response([])
+
+        # Handle numeric queries (ID/Phone)
         if query.isdigit() and len(query) >= 3:
             queryset = VoterRecord.objects.filter(
                 Q(id_number__icontains=query) | Q(phone_number__icontains=query)
             )[:15]
-            return response.Response(VoterRecordSerializer(queryset, many=True).data)
+            return response.Response(VoterRecordSerializer(queryset, many=True, context={'request': request}).data)
 
         # Name-based search (match all name parts of length >= 2)
         name_parts = [p for p in query.upper().split(' ') if len(p) >= 2]
@@ -478,7 +759,7 @@ class VoterLookupView(views.APIView):
         
         queryset = queryset[:15]
 
-        serializer = VoterRecordSerializer(queryset, many=True)
+        serializer = VoterRecordSerializer(queryset, many=True, context={'request': request})
         return response.Response(serializer.data)
 
 
@@ -486,7 +767,7 @@ class VoterLookupView(views.APIView):
 class PollingCoverageView(views.APIView):
     """
     Returns DCP member count per ward and polling station,
-    mapped against the known 142-station Ol Kalou register.
+    mapped against the known 142-station Laikipia register.
     Accessible to all authenticated members.
     """
     permission_classes = [IsAuthenticated]
@@ -550,7 +831,6 @@ class LeaderboardView(views.APIView):
 
     def get(self, request):
         # Top mobilizers (direct invites, excluding admins/staff)
-        from django.utils import timezone
         from datetime import timedelta
         now = timezone.now()
         seven_days_ago = now - timedelta(days=7)
@@ -748,8 +1028,13 @@ class TransportListView(views.APIView):
         ])
 
     def post(self, request):
-        d = request.data
         member = request.user
+        if not member.is_admin and not member.agent_assignments.exists():
+            return response.Response(
+                {"error": "ACCESS DENIED: Form 34A PVT tally upload is strictly restricted to accredited Polling Agents."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        d = request.data
         tr, created = TransportRequest.objects.get_or_create(
             member=member,
             defaults={
@@ -797,6 +1082,10 @@ class AgentListView(views.APIView):
                 'polling_station': a.polling_station,
                 'checked_in': a.checked_in,
                 'check_in_time': a.check_in_time,
+                'breakfast_received': a.breakfast_received,
+                'breakfast_received_at': a.breakfast_received_at,
+                'lunch_received': a.lunch_received,
+                'lunch_received_at': a.lunch_received_at,
                 'notes': a.notes,
             }
             for a in qs.order_by('ward', 'polling_station')
@@ -830,14 +1119,37 @@ class AgentCheckInView(views.APIView):
             agent = PollingAgent.objects.get(pk=pk)
         except PollingAgent.DoesNotExist:
             return response.Response({'error': 'Not found'}, status=status.HTTP_404_NOT_FOUND)
-        agent.checked_in = not agent.checked_in
-        agent.check_in_time = datetime.datetime.now() if agent.checked_in else None
-        agent.save(update_fields=['checked_in', 'check_in_time'])
+
+        action = request.data.get('action', 'checkin')
+        now = timezone.now()
+
+        if action == 'breakfast':
+            agent.breakfast_received = not agent.breakfast_received
+            agent.breakfast_received_at = now if agent.breakfast_received else None
+            agent.save(update_fields=['breakfast_received', 'breakfast_received_at'])
+        elif action == 'lunch':
+            agent.lunch_received = not agent.lunch_received
+            agent.lunch_received_at = now if agent.lunch_received else None
+            agent.save(update_fields=['lunch_received', 'lunch_received_at'])
+        else:
+            # Default station checkin
+            agent.checked_in = not agent.checked_in
+            agent.check_in_time = now if agent.checked_in else None
+            agent.save(update_fields=['checked_in', 'check_in_time'])
+
         return response.Response({
             'id': agent.id,
             'checked_in': agent.checked_in,
             'check_in_time': agent.check_in_time,
+            'breakfast_received': agent.breakfast_received,
+            'breakfast_received_at': agent.breakfast_received_at,
+            'lunch_received': agent.lunch_received,
+            'lunch_received_at': agent.lunch_received_at,
         })
+
+    def post(self, request, pk):
+        # Support POST method as well
+        return self.patch(request, pk)
 
 
 # ─── PVT: Tally Records ───────────────────────────────────────────────────────
@@ -889,8 +1201,13 @@ class TallyListView(views.APIView):
         })
 
     def post(self, request):
-        d = request.data
         member = request.user
+        if not member.is_admin and not member.agent_assignments.exists():
+            return response.Response(
+                {"error": "ACCESS DENIED: Form 34A PVT tally upload is strictly restricted to accredited Polling Agents."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        d = request.data
         tally, created = TallyRecord.objects.update_or_create(
             polling_station=d.get('polling_station', ''),
             submitted_by=member,
@@ -926,6 +1243,8 @@ class SmsExportView(views.APIView):
     def get(self, request):
         ward = request.query_params.get('ward', '')
         station = request.query_params.get('station', '')
+        exclude_opted_out = request.query_params.get('exclude_opted_out', 'true').lower() in ('true', '1')
+
         qs = Member.objects.filter(is_admin=False, is_staff=False)
         if ward:
             qs = qs.filter(Q(ward__icontains=ward) | Q(official_ward__icontains=ward))
@@ -934,18 +1253,27 @@ class SmsExportView(views.APIView):
                 Q(polling_station__icontains=station) |
                 Q(official_polling_station__icontains=station)
             )
+        
+        total_in_scope = qs.count()
+        opted_out_count = qs.filter(is_opted_out=True).count()
+        if exclude_opted_out:
+            qs = qs.filter(is_opted_out=False)
+
         recipients = [
             {
                 'name': m.full_name,
                 'phone': m.phone,
                 'ward': m.official_ward or m.ward,
                 'station': m.official_polling_station or m.polling_station,
+                'is_opted_out': m.is_opted_out,
             }
             for m in qs.order_by('ward', 'full_name')
             if m.phone
         ]
         return response.Response({
             'count': len(recipients),
+            'total_in_scope': total_in_scope,
+            'opted_out_excluded': opted_out_count if exclude_opted_out else 0,
             'recipients': recipients,
         })
 
@@ -1197,13 +1525,75 @@ class EmergencyBroadcastView(views.APIView):
         EmergencyBroadcast.objects.filter(is_active=True).update(is_active=False)
         return response.Response({"status": "Broadcast cleared"}, status=status.HTTP_200_OK)
 
+LAIKIPIA_WEST_STATIONS = {
+    "Ol-Moran": [
+        "Ol Moran Primary School",
+        "Ol Moran Secondary School",
+        "Sipili Primary School",
+        "Sipili Secondary School",
+        "Tumaini Primary School",
+        "Dimcom Primary School",
+        "Mugei Primary School",
+        "Larisoro Primary School"
+    ],
+    "Rumuruti Township": [
+        "Rumuruti Primary School",
+        "Rumuruti Stadium / Social Hall",
+        "Rumuruti Secondary School",
+        "Kandutura Primary School",
+        "Mutamaiyu Primary School",
+        "Lorien Primary School",
+        "African Independent Church Centre",
+        "Rumuruti Sub-County HQ"
+    ],
+    "Githiga": [
+        "Githiga Primary School",
+        "Matuiku Primary School",
+        "Maina Primary School",
+        "Kinamba Primary School",
+        "Kinamba Secondary School",
+        "Mahianyu Primary School",
+        "Tandare Primary School",
+        "Wangwaci Primary School"
+    ],
+    "Marmanet": [
+        "Marmanet Primary School",
+        "Marmanet Secondary School",
+        "Siron Primary School",
+        "Gatundia Primary School",
+        "Melwa Primary School",
+        "Kianjogu Primary School",
+        "Maili Tisa Primary School",
+        "Muhotetu Primary School"
+    ],
+    "Salama": [
+        "Salama Primary School",
+        "Pesi Primary School",
+        "Muruku Primary School",
+        "Muruku Secondary School",
+        "Kiamariki Primary School",
+        "Sirima Primary School",
+        "Ndurumo Secondary School",
+        "Thome Primary School"
+    ],
+    "Sosian": [
+        "Sosian Primary School",
+        "Ewaso Primary School",
+        "Naibor Primary School",
+        "Kimanjo Primary School",
+        "Kimanjo Secondary School",
+        "Il Polei Primary School",
+        "Doldol Primary School",
+        "Mogogendo Primary School"
+    ]
+}
+
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def get_wards_and_stations(request):
-    """Returns a dictionary mapping Wards to their unique Polling Stations."""
-    wards_data = VoterRecord.objects.values('ward', 'polling_station').distinct()
-    
+    """Returns a dictionary mapping all Laikipia Wards to their unique Polling Stations directly from the official voter register."""
     mapping = {}
+    wards_data = VoterRecord.objects.values('ward', 'polling_station').distinct().order_by('ward', 'polling_station')
     for entry in wards_data:
         ward = entry.get('ward')
         station = entry.get('polling_station')
@@ -1216,9 +1606,46 @@ def get_wards_and_stations(request):
         if station and station not in mapping[ward]:
             mapping[ward].append(station)
             
+    if not mapping:
+        mapping = {k: list(v) for k, v in LAIKIPIA_WEST_STATIONS.items()}
+
     sorted_mapping = {w: sorted(s) for w, s in sorted(mapping.items())}
     return response.Response(sorted_mapping)
 
+
+
+class MemberToggleOptOutView(views.APIView):
+    """
+    Toggles supporter opt-out status pursuant to Kenya Data Protection Act 2019 Section 40 (Right to Erasure / Unsubscribe).
+    Excludes the supporter from bulk SMS and automated outreach lists.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        try:
+            member = Member.objects.get(pk=pk)
+            # Admin, staff, or the user themselves can toggle opt-out status
+            if not (request.user.is_admin or request.user.is_staff or request.user.id == member.id):
+                return response.Response({"error": "Unauthorized to modify opt-out status."}, status=status.HTTP_403_FORBIDDEN)
+
+            member.is_opted_out = not member.is_opted_out
+            member.opted_out_at = timezone.now() if member.is_opted_out else None
+            member.save(update_fields=['is_opted_out', 'opted_out_at'])
+
+            action = 'MEMBER_OPTED_OUT' if member.is_opted_out else 'MEMBER_OPTED_IN'
+            AuditLog.log(action, user=request.user, request=request, details={
+                'member_id': member.id,
+                'phone': member.phone,
+                'is_opted_out': member.is_opted_out
+            })
+
+            return response.Response({
+                "message": f"{member.full_name} is now {'OPTED OUT (STOP)' if member.is_opted_out else 'OPTED IN'}.",
+                "is_opted_out": member.is_opted_out,
+                "opted_out_at": member.opted_out_at
+            })
+        except Member.DoesNotExist:
+            return response.Response({"error": "Member not found."}, status=status.HTTP_404_NOT_FOUND)
 
 class MemberToggleActiveView(views.APIView):
     permission_classes = [IsAuthenticated]
@@ -1530,6 +1957,8 @@ class SecurityLogListView(views.APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
+        if not request.user.is_admin:
+            return response.Response({"detail": "Admin security access required."}, status=status.HTTP_403_FORBIDDEN)
         qs = SecurityLog.objects.select_related('guard').all().order_by('-logged_at')
         user = request.user
         if not user.is_admin:
@@ -1638,3 +2067,228 @@ class SecurityMIAView(views.APIView):
                 })
                 
         return response.Response(mia_list)
+
+
+# ─── Governor Campaign Diary & Chama Functions ──────────────────────────────
+from .models import CampaignFunction
+from .serializers import CampaignFunctionSerializer
+
+class CampaignFunctionListView(views.APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        qs = CampaignFunction.objects.all().select_related('submitted_by')
+
+        # Privacy Scoping: Mobilizers only see functions they personally submitted OR official Governor rallies
+        if not request.user.is_admin:
+            qs = qs.filter(Q(submitted_by=request.user) | Q(is_created_by_governor=True))
+
+        constituency = request.query_params.get('constituency')
+        if constituency and constituency != 'all':
+            qs = qs.filter(constituency__iexact=constituency)
+
+        ward = request.query_params.get('ward')
+        if ward and ward != 'all':
+            qs = qs.filter(ward__iexact=ward)
+
+        status_filter = request.query_params.get('status')
+        if status_filter and status_filter != 'all':
+            qs = qs.filter(status=status_filter)
+
+        event_type = request.query_params.get('type')
+        if event_type and event_type != 'all':
+            qs = qs.filter(event_type=event_type)
+
+        # Access rule:
+        # Admins/Secretariat: see everything
+        # Regular Mobilizers: see confirmed/delegated events + all events they submitted themselves
+        if not request.user.is_admin:
+            qs = qs.filter(Q(status__in=['attending', 'delegated']) | Q(submitted_by=request.user))
+
+        serializer = CampaignFunctionSerializer(qs, many=True, context={'request': request})
+        return response.Response(serializer.data)
+
+    def post(self, request):
+        data = request.data.copy()
+        is_admin = request.user.is_admin or request.user.is_staff or request.user.is_superuser
+
+        if is_admin:
+            data['is_created_by_governor'] = True
+            if 'status' not in data:
+                data['status'] = 'attending'
+        else:
+            data['is_created_by_governor'] = False
+            data['status'] = 'pending'
+
+        serializer = CampaignFunctionSerializer(data=data, context={'request': request})
+        if serializer.is_valid():
+            function_obj = serializer.save(submitted_by=request.user)
+            return response.Response(
+                CampaignFunctionSerializer(function_obj, context={'request': request}).data,
+                status=status.HTTP_201_CREATED
+            )
+        return response.Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class CampaignFunctionDetailView(views.APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        try:
+            func = CampaignFunction.objects.select_related('submitted_by').get(pk=pk)
+        except CampaignFunction.DoesNotExist:
+            return response.Response({'error': 'Function not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        if not request.user.is_admin and func.status not in ['attending', 'delegated'] and func.submitted_by_id != request.user.id:
+            return response.Response({'error': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
+
+        serializer = CampaignFunctionSerializer(func, context={'request': request})
+        return response.Response(serializer.data)
+
+    def patch(self, request, pk):
+        try:
+            func = CampaignFunction.objects.get(pk=pk)
+        except CampaignFunction.DoesNotExist:
+            return response.Response({'error': 'Function not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        is_admin = request.user.is_admin or request.user.is_staff or request.user.is_superuser
+        is_submitter = (func.submitted_by_id == request.user.id)
+
+        if not is_admin and not is_submitter:
+            return response.Response({'error': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
+
+        data = request.data.copy()
+        # Non-admins cannot change status or delegate
+        if not is_admin:
+            data.pop('status', None)
+            data.pop('delegate_name', None)
+            data.pop('delegate_phone', None)
+            data.pop('admin_notes', None)
+
+        serializer = CampaignFunctionSerializer(func, data=data, partial=True, context={'request': request})
+        if serializer.is_valid():
+            updated = serializer.save()
+            return response.Response(CampaignFunctionSerializer(updated, context={'request': request}).data)
+        return response.Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    def delete(self, request, pk):
+        if not request.user.is_admin:
+            return response.Response({'error': 'Admin privileges required'}, status=status.HTTP_403_FORBIDDEN)
+        try:
+            func = CampaignFunction.objects.get(pk=pk)
+            func.delete()
+            return response.Response({'message': 'Function deleted successfully'})
+        except CampaignFunction.DoesNotExist:
+            return response.Response({'error': 'Function not found'}, status=status.HTTP_404_NOT_FOUND)
+
+# ─── Campaign Config & Social Media Recruitment ──────────────────────────────
+class CampaignConfigView(views.APIView):
+    permission_classes = [AllowAny]
+    
+    def get(self, request):
+        configs = CampaignConfig.objects.all()
+        data = {c.key: c.value for c in configs}
+        if 'whatsapp_community_link' not in data or not data['whatsapp_community_link']:
+            data['whatsapp_community_link'] = 'https://chat.whatsapp.com/sample-laikipia'
+        return response.Response(data)
+
+    def post(self, request):
+        if not request.user.is_authenticated or not (request.user.is_admin or request.user.is_staff):
+            return response.Response({"error": "Admin credentials required"}, status=status.HTTP_403_FORBIDDEN)
+        key = request.data.get('key')
+        value = request.data.get('value', '')
+        if not key:
+            return response.Response({"error": "Key is required"}, status=status.HTTP_400_BAD_REQUEST)
+        config, _ = CampaignConfig.objects.update_or_create(key=key, defaults={'value': value})
+        return response.Response({"success": True, "key": config.key, "value": config.value})
+
+class MemberCheckStatusView(views.APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        national_id = str(request.data.get('national_id', '')).strip()
+        phone = str(request.data.get('phone', '')).strip()
+        if not national_id and not phone:
+            return response.Response({"error": "National ID or Phone required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        query = Q()
+        if national_id:
+            query |= Q(national_id=national_id)
+        if phone:
+            query |= Q(phone=phone)
+
+        existing = Member.objects.filter(query).first()
+        if not existing:
+            return response.Response({"status": "not_registered", "message": "No existing registration found."})
+
+        if existing.referred_by is not None:
+            return response.Response({
+                "status": "locked",
+                "message": f"Already registered under Mobilizer {existing.referred_by.full_name}.",
+                "member_name": existing.full_name,
+                "referrer_name": existing.referred_by.full_name,
+                "ward": existing.ward
+            })
+        else:
+            return response.Response({
+                "status": "can_claim",
+                "message": "Found Online / Unassigned Recruit!",
+                "member_id": existing.id,
+                "member_name": existing.full_name,
+                "ward": existing.ward,
+                "polling_station": existing.polling_station,
+                "source": getattr(existing, 'source', 'social_media')
+            })
+
+class MemberClaimSocialView(views.APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        allowed, remaining, retry_after = check_rate_limit(request, 'claim_social', max_requests=15, window_seconds=60, extra_key=str(request.user.id))
+        if not allowed:
+            return response.Response({
+                "error": "rate_limit_exceeded",
+                "message": f"Too many adoption attempts. Please wait {retry_after} seconds before trying again.",
+                "retry_after": retry_after
+            }, status=status.HTTP_429_TOO_MANY_REQUESTS)
+
+        mobilizer = request.user
+        national_id = str(request.data.get('national_id', '')).strip()
+        phone = str(request.data.get('phone', '')).strip()
+        if not national_id or not phone:
+            return response.Response({"error": "Both National ID and Phone number are required to verify the recruit in-person."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Match exact ID and Phone
+        recruit = Member.objects.filter(national_id=national_id, phone=phone).first()
+        if not recruit:
+            return response.Response({"error": "No matching member found with that National ID and Phone."}, status=status.HTTP_404_NOT_FOUND)
+
+        if recruit.id == mobilizer.id:
+            return response.Response({"error": "You cannot adopt yourself."}, status=status.HTTP_400_BAD_REQUEST)
+
+        if recruit.referred_by is not None:
+            return response.Response({
+                "error": f"This member is already registered under Mobilizer {recruit.referred_by.full_name} and cannot be reassigned."
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Check mobilizer quota
+        quota = 10 if mobilizer.referred_by is None else 5
+        current_count = mobilizer.recruits.count()
+        if current_count >= quota:
+            return response.Response({"error": f"You have reached your quota limit of {quota} recruits."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Assign recruit to this mobilizer
+        recruit.referred_by = mobilizer
+        recruit.save(update_fields=['referred_by'])
+        AuditLog.log('RECRUIT_ADOPTED', user=mobilizer, request=request, details={
+            'recruit_id': recruit.id,
+            'recruit_name': recruit.full_name,
+            'ward': recruit.ward
+        })
+
+        return response.Response({
+            "success": True,
+            "message": f"Successfully adopted {recruit.full_name} to your team!",
+            "recruit": MemberSerializer(recruit, context={'request': request}).data
+        })
+

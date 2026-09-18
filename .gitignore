@@ -2,5 +2,7 @@ venv/
 __pycache__/
 *.sqlite3
 .env
-olkalau data/
 staticfiles/
+datadump.json
+iebc_data/Laikipia County/
+iebc_data/Laikipia Combined.xlsx

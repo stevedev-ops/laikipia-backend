@@ -176,14 +176,24 @@ REST_FRAMEWORK = {
         'rest_framework.throttling.UserRateThrottle'
     ],
     'DEFAULT_THROTTLE_RATES': {
-        'anon': '100/day',
-        'user': '1000/day',
-        'login': '5/minute',  # Custom rate for the login view
+        'anon': '120/day',
+        'user': '1200/day',
+        'login': '5/minute',
+        'register': '15/minute',
+        'voter_lookup': '30/minute',
+        'claim_social': '15/minute',
+        'export_csv': '25/hour',
     }
 }
 
-CORS_ALLOW_ALL_ORIGINS = True # Allow all origins globally for Render deployment
+CORS_ALLOW_ALL_ORIGINS = env.bool('CORS_ALLOW_ALL_ORIGINS', default=DEBUG)
 CORS_ALLOWED_ORIGINS = env.list('CORS_ALLOWED_ORIGINS', default=[])
+
+from corsheaders.defaults import default_headers
+CORS_ALLOW_HEADERS = list(default_headers) + [
+    'x-device-fingerprint',
+    'x-csrftoken',
+]
 APPEND_SLASH = False
 
 # Static files production configuration
@@ -199,3 +209,12 @@ STORAGES = {
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
+
+
+# ─── SECURITY HARDENING ────────────────────────────────────────────────────────
+SECURE_BROWSER_XSS_FILTER = True
+SECURE_CONTENT_TYPE_NOSNIFF = True
+X_FRAME_OPTIONS = 'DENY'
+SECURE_REFERRER_POLICY = 'strict-origin-when-cross-origin'
+
+# Throttle rates enforced in REST_FRAMEWORK['DEFAULT_THROTTLE_RATES']

@@ -1,24 +1,28 @@
 services:
   - type: web
-    name: ol-kalou-backend
+    name: laikipia-backend
     env: python
-    buildCommand: pip install -r requirements.txt && python manage.py collectstatic --noinput && python manage.py migrate && python create_users.py
+    region: frankfurt
+    buildCommand: pip install -r requirements.txt && python manage.py collectstatic --noinput && python manage.py migrate && python create_users.py && python manage.py sync_master_voters
     startCommand: gunicorn core.wsgi --log-file -
     envVars:
       - key: DATABASE_URL
         fromDatabase:
-          name: ol-kalou-db
+          name: laikipia-db
           property: connectionString
       - key: SECRET_KEY
         generateValue: true
       - key: DEBUG
         value: "False"
       - key: ALLOWED_HOSTS
-        value: "*" # Change this to your frontend domain once it's live
+        value: "*"
+      - key: CORS_ALLOW_ALL_ORIGINS
+        value: "True"
       - key: CORS_ALLOWED_ORIGINS
-        value: "https://ol-kalou-frontend.vercel.app,https://olkaloudcpgetoutthevotenetwork.org,https://www.olkaloudcpgetoutthevotenetwork.org"
+        value: "https://*.vercel.app,https://laikipia-frontend.vercel.app,https://ol-kalou-frontend.vercel.app"
       
 databases:
-  - name: ol-kalou-db
-    databaseName: olkalou
-    user: olkalou
+  - name: laikipia-db
+    databaseName: laikipiadb
+    user: laikipia
+    region: frankfurt
