@@ -186,8 +186,32 @@ REST_FRAMEWORK = {
     }
 }
 
-CORS_ALLOW_ALL_ORIGINS = env.bool('CORS_ALLOW_ALL_ORIGINS', default=DEBUG)
-CORS_ALLOWED_ORIGINS = env.list('CORS_ALLOWED_ORIGINS', default=[])
+CORS_ALLOW_ALL_ORIGINS = env.bool('CORS_ALLOW_ALL_ORIGINS', default=True)
+CORS_ALLOWED_ORIGINS = env.list('CORS_ALLOWED_ORIGINS', default=[
+    "https://laikipia-west-frontend.vercel.app",
+    "https://kuriaforgovernor.co.ke",
+    "https://www.kuriaforgovernor.co.ke",
+    "http://kuriaforgovernor.co.ke",
+    "http://www.kuriaforgovernor.co.ke",
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:3000",
+])
+
+CORS_ALLOWED_ORIGIN_REGEXES = [
+    r"^https://.*\.vercel\.app$",
+    r"^https://.*\.kuriaforgovernor\.co\.ke$",
+]
+
+CSRF_TRUSTED_ORIGINS = env.list('CSRF_TRUSTED_ORIGINS', default=[
+    "https://laikipia-west-frontend.vercel.app",
+    "https://kuriaforgovernor.co.ke",
+    "https://www.kuriaforgovernor.co.ke",
+    "http://kuriaforgovernor.co.ke",
+    "https://*.vercel.app",
+    "https://*.onrender.com",
+])
 
 from corsheaders.defaults import default_headers
 CORS_ALLOW_HEADERS = list(default_headers) + [

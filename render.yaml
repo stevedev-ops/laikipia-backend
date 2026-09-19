@@ -19,7 +19,9 @@ services:
       - key: CORS_ALLOW_ALL_ORIGINS
         value: "True"
       - key: CORS_ALLOWED_ORIGINS
-        value: "https://*.vercel.app,https://laikipia-frontend.vercel.app,https://ol-kalou-frontend.vercel.app"
+        value: "https://laikipia-west-frontend.vercel.app,https://kuriaforgovernor.co.ke,https://www.kuriaforgovernor.co.ke,http://kuriaforgovernor.co.ke"
+      - key: CSRF_TRUSTED_ORIGINS
+        value: "https://laikipia-west-frontend.vercel.app,https://kuriaforgovernor.co.ke,https://www.kuriaforgovernor.co.ke"
       
 databases:
   - name: laikipia-db
