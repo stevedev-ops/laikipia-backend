@@ -61,6 +61,36 @@ class Member(AbstractBaseUser, PermissionsMixin):
     supporter_score = models.IntegerField(null=True, blank=True) # 1-5 scale
     top_issue = models.CharField(max_length=255, null=True, blank=True)
 
+    # 7-Tier Campaign Hierarchy & Command Structure
+    CAMPAIGN_ROLES = [
+        ('governor', 'Governor Aspirant'),
+        ('county_manager', 'County Campaigns Manager'),
+        ('sub_county_coordinator', 'Sub-County Coordinator'),
+        ('ward_coordinator', 'Ward Coordinator'),
+        ('polling_centre_coordinator', 'Polling Centre Coordinator'),
+        ('pillar', 'Campaign Pillar'),
+        ('station_mobilizer', 'Polling Station Mobilizer'),
+    ]
+    PILLAR_CATEGORIES = [
+        ('none', 'None'),
+        ('youth', 'Youth Pillar'),
+        ('women', 'Women Pillar'),
+        ('elders_business', 'Elders & Business Pillar'),
+        ('special_interest', 'Special Interest Pillar'),
+    ]
+    campaign_role = models.CharField(max_length=50, choices=CAMPAIGN_ROLES, default='station_mobilizer', db_index=True)
+    pillar_category = models.CharField(max_length=50, choices=PILLAR_CATEGORIES, default='none')
+    assigned_sub_county = models.CharField(max_length=255, blank=True, null=True, db_index=True)
+    assigned_ward = models.CharField(max_length=255, blank=True, null=True, db_index=True)
+    assigned_polling_centre = models.CharField(max_length=255, blank=True, null=True, db_index=True)
+    supervisor = models.ForeignKey(
+        'self',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='subordinates'
+    )
+
     # Recruitment Source & Volunteer Role
     SOURCE_CHOICES = [
         ('field_mobilizer', 'Field Mobilizer'),

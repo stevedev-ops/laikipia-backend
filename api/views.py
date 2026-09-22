@@ -15,7 +15,7 @@ from .models import (
     CallRecord, EmergencyBroadcast, SecurityLog
 )
 from .security import check_rate_limit, check_honeypot, get_client_ip, rate_limit
-from .serializers import MemberSerializer, CampaignConfigSerializer, InviteSerializer, VoterRecordSerializer, EventSerializer, EmergencyBroadcastSerializer
+from .serializers import MemberSerializer, CampaignPersonnelSerializer, CampaignConfigSerializer, InviteSerializer, VoterRecordSerializer, EventSerializer, EmergencyBroadcastSerializer
 
 from rest_framework.authtoken.models import Token
 from rest_framework.permissions import AllowAny, IsAuthenticated, IsAdminUser
@@ -2292,3 +2292,551 @@ class MemberClaimSocialView(views.APIView):
             "recruit": MemberSerializer(recruit, context={'request': request}).data
         })
 
+
+
+class AdminChangePasswordView(views.APIView):
+    """
+    Allows authenticated admin/staff users to securely update their account password.
+    POST /api/admin/change-password
+    """
+    permission_classes = [IsAdminUser]
+
+    def post(self, request):
+        user = request.user
+        data = request.data or {}
+        
+        current_password = str(data.get('current_password') or '').strip()
+        new_password = str(data.get('new_password') or '').strip()
+        confirm_password = str(data.get('confirm_password') or '').strip()
+
+        if not new_password or len(new_password) < 6:
+            return response.Response(
+                {"error": "New password must be at least 6 characters long."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if new_password != confirm_password:
+            return response.Response(
+                {"error": "New password and confirmation do not match."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Verify current password if user has one
+        if user.has_usable_password() and current_password:
+            if not user.check_password(current_password):
+                AuditLog.log('PASSWORD_CHANGE_FAILED', user=user, request=request, details={'reason': 'incorrect_current_password'})
+                return response.Response(
+                    {"error": "Current password is incorrect."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        elif user.has_usable_password() and not current_password:
+            return response.Response(
+                {"error": "Current password is required."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        user.set_password(new_password)
+        user.save()
+
+        AuditLog.log('PASSWORD_CHANGED_SUCCESS', user=user, request=request)
+
+        return response.Response({
+            "status": "success",
+            "message": "Password updated successfully."
+        }, status=status.HTTP_200_OK)
+
+
+# ─── 7-Tier Campaign Hierarchy & Command Views ─────────────────────────────────
+
+class CampaignHierarchyStatsView(views.APIView):
+    """High-level role counts, quotas, and health breakdown across the campaign."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        counts = {
+            'governor': Member.objects.filter(campaign_role='governor', is_active=True).count(),
+            'county_manager': Member.objects.filter(campaign_role='county_manager', is_active=True).count(),
+            'sub_county_coordinator': Member.objects.filter(campaign_role='sub_county_coordinator', is_active=True).count(),
+            'ward_coordinator': Member.objects.filter(campaign_role='ward_coordinator', is_active=True).count(),
+            'polling_centre_coordinator': Member.objects.filter(campaign_role='polling_centre_coordinator', is_active=True).count(),
+            'pillar': Member.objects.filter(campaign_role='pillar', is_active=True).count(),
+            'station_mobilizer': Member.objects.filter(campaign_role='station_mobilizer', is_active=True).count(),
+            'total_personnel': Member.objects.filter(is_active=True).count(),
+        }
+        pillar_counts = {
+            'youth': Member.objects.filter(campaign_role='pillar', pillar_category='youth', is_active=True).count(),
+            'women': Member.objects.filter(campaign_role='pillar', pillar_category='women', is_active=True).count(),
+            'elders_business': Member.objects.filter(campaign_role='pillar', pillar_category='elders_business', is_active=True).count(),
+            'special_interest': Member.objects.filter(campaign_role='pillar', pillar_category='special_interest', is_active=True).count(),
+        }
+
+        # Calculate polling station coverage quota
+        # Distinct polling stations in DB
+        stations = VoterRecord.objects.exclude(polling_station__isnull=True).exclude(polling_station='').values_list('polling_station', flat=True).distinct()
+        total_stations = len(stations) or 1
+
+        # Stations with at least 1 coordinator
+        station_with_coord = Member.objects.filter(campaign_role='polling_centre_coordinator', is_active=True).values_list('assigned_polling_centre', flat=True).distinct().count()
+        # Stations with 3 pillars filled
+        # Stations with 25 mobilizers filled
+
+        return response.Response({
+            'role_counts': counts,
+            'pillar_counts': pillar_counts,
+            'total_stations': total_stations,
+            'stations_with_coordinator': station_with_coord,
+            'targets_per_station': {
+                'pillars_target': 3,
+                'mobilizers_target': 25,
+                'coordinators_target': 1,
+            }
+        })
+
+
+class CampaignHierarchyTreeView(views.APIView):
+    """
+    Returns the hierarchy tree structured by Ward -> Polling Centre -> [Coordinator, 3 Pillars, 25 Mobilizers].
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        ward_filter = request.query_params.get('ward', '').strip()
+        search_query = request.query_params.get('search', '').strip()
+
+        # Collect all active personnel
+        qs = Member.objects.filter(is_active=True)
+        if ward_filter:
+            qs = qs.filter(Q(assigned_ward=ward_filter) | Q(ward=ward_filter))
+        if search_query:
+            qs = qs.filter(Q(full_name__icontains=search_query) | Q(phone__icontains=search_query) | Q(national_id__icontains=search_query))
+
+        # Distinct Wards
+        wards_data = []
+        ward_names = VoterRecord.objects.exclude(ward__isnull=True).exclude(ward='').values_list('ward', flat=True).distinct().order_by('ward')
+        if not ward_names.exists():
+            ward_names = Member.objects.exclude(ward__isnull=True).exclude(ward='').values_list('ward', flat=True).distinct().order_by('ward')
+
+        if ward_filter:
+            ward_names = [w for w in ward_names if w.lower() == ward_filter.lower()]
+            if not ward_names:
+                ward_names = [ward_filter]
+
+        for w_name in ward_names:
+            ward_coord = Member.objects.filter(
+                campaign_role='ward_coordinator',
+                assigned_ward__iexact=w_name,
+                is_active=True
+            ).first()
+
+            # Find polling stations in this ward
+            stations_in_ward = VoterRecord.objects.filter(ward__iexact=w_name).exclude(polling_station__isnull=True).exclude(polling_station='').values_list('polling_station', flat=True).distinct().order_by('polling_station')
+            if not stations_in_ward.exists():
+                stations_in_ward = Member.objects.filter(ward__iexact=w_name).exclude(polling_station__isnull=True).exclude(polling_station='').values_list('polling_station', flat=True).distinct().order_by('polling_station')
+
+            stations_data = []
+            for s_name in stations_in_ward:
+                centre_coord = Member.objects.filter(
+                    campaign_role='polling_centre_coordinator',
+                    assigned_polling_centre__iexact=s_name,
+                    is_active=True
+                ).first()
+
+                pillars = Member.objects.filter(
+                    campaign_role='pillar',
+                    assigned_polling_centre__iexact=s_name,
+                    is_active=True
+                ).order_by('created_at')[:3]
+
+                mobilizers = Member.objects.filter(
+                    Q(campaign_role='station_mobilizer') | Q(campaign_role=''),
+                    Q(assigned_polling_centre__iexact=s_name) | Q(polling_station__iexact=s_name),
+                    is_active=True
+                ).order_by('-created_at')[:25]
+
+                stations_data.append({
+                    'polling_station': s_name,
+                    'ward': w_name,
+                    'coordinator': CampaignPersonnelSerializer(centre_coord).data if centre_coord else None,
+                    'pillars': CampaignPersonnelSerializer(pillars, many=True).data,
+                    'pillars_count': pillars.count(),
+                    'pillars_target': 3,
+                    'mobilizers': CampaignPersonnelSerializer(mobilizers, many=True).data,
+                    'mobilizers_count': mobilizers.count(),
+                    'mobilizers_target': 25,
+                    'is_quota_filled': (pillars.count() >= 3 and mobilizers.count() >= 25),
+                })
+
+            wards_data.append({
+                'ward': w_name,
+                'coordinator': CampaignPersonnelSerializer(ward_coord).data if ward_coord else None,
+                'polling_stations': stations_data,
+                'total_stations': len(stations_data),
+            })
+
+        # Top leadership
+        governors = Member.objects.filter(campaign_role='governor', is_active=True)
+        managers = Member.objects.filter(campaign_role='county_manager', is_active=True)
+        sub_county_coords = Member.objects.filter(campaign_role='sub_county_coordinator', is_active=True)
+
+        return response.Response({
+            'leadership': {
+                'governors': CampaignPersonnelSerializer(governors, many=True).data,
+                'county_managers': CampaignPersonnelSerializer(managers, many=True).data,
+                'sub_county_coordinators': CampaignPersonnelSerializer(sub_county_coords, many=True).data,
+            },
+            'wards': wards_data
+        })
+
+
+class CampaignDirectoryView(views.APIView):
+    """
+    Searchable phonebook & directory for leadership to contact anyone down the chain.
+    Provides direct phone numbers for Calling (tel:) and WhatsApp messaging.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        role = request.query_params.get('role', '').strip()
+        ward = request.query_params.get('ward', '').strip()
+        station = request.query_params.get('station', '').strip()
+        category = request.query_params.get('pillar_category', '').strip()
+        q = request.query_params.get('search', '').strip()
+
+        members = Member.objects.filter(is_active=True)
+
+        if role:
+            members = members.filter(campaign_role=role)
+        if ward:
+            members = members.filter(Q(assigned_ward__iexact=ward) | Q(ward__iexact=ward))
+        if station:
+            members = members.filter(Q(assigned_polling_centre__iexact=station) | Q(polling_station__iexact=station))
+        if category:
+            members = members.filter(pillar_category=category)
+        if q:
+            members = members.filter(
+                Q(full_name__icontains=q) | Q(phone__icontains=q) | Q(national_id__icontains=q)
+            )
+
+        # Pagination or top 100
+        members = members.order_by('-created_at')[:150]
+        serializer = CampaignPersonnelSerializer(members, many=True)
+        return response.Response(serializer.data)
+
+
+class CampaignMyTeamView(views.APIView):
+    """
+    Returns the direct team that the authenticated member directly manages.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+        role = getattr(user, 'campaign_role', 'station_mobilizer')
+        is_admin_user = getattr(user, 'is_admin', False) or getattr(user, 'is_staff', False) or getattr(user, 'is_superuser', False)
+
+        subordinates = []
+        team_title = "My Direct Team"
+        can_appoint = False
+        allowed_roles_to_appoint = []
+
+        if is_admin_user or role in ['governor', 'county_manager']:
+            team_title = "County Campaign Command"
+            can_appoint = True
+            allowed_roles_to_appoint = [
+                'county_manager', 'sub_county_coordinator', 'ward_coordinator',
+                'polling_centre_coordinator', 'pillar', 'station_mobilizer'
+            ]
+            subordinates = Member.objects.filter(
+                Q(supervisor=user) | Q(campaign_role__in=['sub_county_coordinator', 'ward_coordinator']),
+                is_active=True
+            ).order_by('campaign_role', 'full_name')
+
+        elif role == 'sub_county_coordinator':
+            team_title = f"Sub-County Team: {user.assigned_sub_county or 'Assigned Sub-County'}"
+            can_appoint = True
+            allowed_roles_to_appoint = ['ward_coordinator', 'polling_centre_coordinator']
+            sub_county = user.assigned_sub_county or ''
+            subordinates = Member.objects.filter(
+                Q(supervisor=user) | (Q(assigned_sub_county=sub_county) & Q(campaign_role='ward_coordinator')),
+                is_active=True
+            ).order_by('full_name')
+
+        elif role == 'ward_coordinator':
+            ward = user.assigned_ward or user.ward or ''
+            team_title = f"Ward Team: {ward or 'Assigned Ward'}"
+            can_appoint = True
+            allowed_roles_to_appoint = ['polling_centre_coordinator', 'pillar', 'station_mobilizer']
+            subordinates = Member.objects.filter(
+                Q(supervisor=user) | (Q(assigned_ward__iexact=ward) & Q(campaign_role='polling_centre_coordinator')),
+                is_active=True
+            ).order_by('assigned_polling_centre', 'full_name')
+
+        elif role == 'polling_centre_coordinator':
+            station = user.assigned_polling_centre or user.polling_station or ''
+            team_title = f"Polling Centre Team: {station}"
+            can_appoint = True
+            allowed_roles_to_appoint = ['pillar', 'station_mobilizer']
+            subordinates = Member.objects.filter(
+                Q(supervisor=user) | (Q(assigned_polling_centre__iexact=station) & Q(campaign_role__in=['pillar', 'station_mobilizer'])),
+                is_active=True
+            ).order_by('campaign_role', 'full_name')
+
+        elif role == 'pillar':
+            station = user.assigned_polling_centre or user.polling_station or ''
+            team_title = f"{user.get_pillar_category_display() if hasattr(user, 'get_pillar_category_display') else 'Pillar'} - Station Mobilizers"
+            can_appoint = False
+            subordinates = Member.objects.filter(
+                Q(assigned_polling_centre__iexact=station) & Q(campaign_role='station_mobilizer'),
+                is_active=True
+            ).order_by('full_name')
+
+        else:
+            # Station mobilizers see their recruits downline
+            team_title = "Voter Recruits & Downline"
+            can_appoint = False
+            subordinates = user.recruits.filter(is_active=True).order_by('-created_at')[:50]
+
+        return response.Response({
+            'user_role': role,
+            'team_title': team_title,
+            'can_appoint': can_appoint,
+            'allowed_roles_to_appoint': allowed_roles_to_appoint,
+            'team_count': subordinates.count() if hasattr(subordinates, 'count') else len(subordinates),
+            'members': CampaignPersonnelSerializer(subordinates, many=True).data
+        })
+
+
+class CampaignAssignRoleView(views.APIView):
+    """
+    Appoint, promote, or assign a member to a specific campaign tier.
+    Enforces strict cascading management authority and quotas:
+      - Governor / County Manager: County-wide authority
+      - Sub-County Coordinator: Only within assigned sub-county (appoints Ward Coordinators)
+      - Ward Coordinator: Only within assigned ward (appoints Polling Centre Coordinators)
+      - Polling Centre Coordinator: Only at assigned station (appoints 3 Pillars & 25 Mobilizers)
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        caller = request.user
+        caller_role = getattr(caller, 'campaign_role', 'station_mobilizer')
+        is_caller_admin = getattr(caller, 'is_admin', False) or getattr(caller, 'is_staff', False) or getattr(caller, 'is_superuser', False)
+
+        data = request.data
+        member_id = data.get('member_id')
+        new_role = data.get('campaign_role')
+        sub_county = data.get('assigned_sub_county', '').strip()
+        ward = data.get('assigned_ward', '').strip()
+        station = data.get('assigned_polling_centre', '').strip()
+        pillar_category = data.get('pillar_category', 'none').strip()
+
+        if not member_id or not new_role:
+            return response.Response(
+                {"error": "member_id and campaign_role are required."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        valid_roles = [r[0] for r in Member.CAMPAIGN_ROLES]
+        if new_role not in valid_roles:
+            return response.Response(
+                {"error": f"Invalid campaign_role. Must be one of: {valid_roles}"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        member = Member.objects.filter(id=member_id).first()
+        if not member:
+            return response.Response(
+                {"error": "Member not found."},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # ─── Strict Cascading Authority Enforcement ────────────────────────────
+        if not is_caller_admin and caller_role not in ['governor', 'county_manager']:
+            if caller_role == 'sub_county_coordinator':
+                caller_sc = (caller.assigned_sub_county or '').strip()
+                if new_role not in ['ward_coordinator', 'polling_centre_coordinator']:
+                    return response.Response(
+                        {"error": "Sub-County Coordinators can only appoint Ward Coordinators or Polling Centre Coordinators."},
+                        status=status.HTTP_403_FORBIDDEN
+                    )
+                if sub_county and caller_sc and sub_county.lower() != caller_sc.lower():
+                    return response.Response(
+                        {"error": f"Access Denied: You can only appoint leaders within your assigned Sub-County ({caller_sc})."},
+                        status=status.HTTP_403_FORBIDDEN
+                    )
+                sub_county = caller_sc # Auto-lock to caller's jurisdiction
+
+            elif caller_role == 'ward_coordinator':
+                caller_ward = (caller.assigned_ward or caller.ward or '').strip()
+                if new_role not in ['polling_centre_coordinator', 'pillar', 'station_mobilizer']:
+                    return response.Response(
+                        {"error": "Ward Coordinators can only appoint Polling Centre Coordinators, Pillars, or Mobilizers."},
+                        status=status.HTTP_403_FORBIDDEN
+                    )
+                if ward and caller_ward and ward.lower() != caller_ward.lower():
+                    return response.Response(
+                        {"error": f"Access Denied: You can only appoint coordinators within your assigned Ward ({caller_ward})."},
+                        status=status.HTTP_403_FORBIDDEN
+                    )
+                ward = caller_ward # Auto-lock to caller's ward
+
+            elif caller_role == 'polling_centre_coordinator':
+                caller_station = (caller.assigned_polling_centre or caller.polling_station or '').strip()
+                caller_ward = (caller.assigned_ward or caller.ward or '').strip()
+                if new_role not in ['pillar', 'station_mobilizer']:
+                    return response.Response(
+                        {"error": "Polling Centre Coordinators can only appoint their 3 Pillars or 25 Mobilizers."},
+                        status=status.HTTP_403_FORBIDDEN
+                    )
+                if station and caller_station and station.lower() != caller_station.lower():
+                    return response.Response(
+                        {"error": f"Access Denied: You can only appoint personnel for your assigned Polling Centre ({caller_station})."},
+                        status=status.HTTP_403_FORBIDDEN
+                    )
+                station = caller_station # Auto-lock to caller's station
+                if not ward:
+                    ward = caller_ward
+
+            else:
+                return response.Response(
+                    {"error": "You do not have appointment permissions in the campaign hierarchy."},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+
+        # Quota Validation Checks
+        if new_role == 'pillar':
+            if not station:
+                return response.Response(
+                    {"error": "Assigned Polling Centre is required for a Campaign Pillar."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            if pillar_category not in ['youth', 'women', 'elders_business', 'special_interest']:
+                return response.Response(
+                    {"error": "A valid pillar category (youth, women, elders_business, special_interest) is required."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            # Check maximum 3 pillars for this station
+            current_pillars = Member.objects.filter(
+                campaign_role='pillar',
+                assigned_polling_centre__iexact=station,
+                is_active=True
+            ).exclude(id=member.id)
+            if current_pillars.count() >= 3:
+                return response.Response(
+                    {
+                        "error": f"Quota Exceeded: Polling Station '{station}' already has 3 assigned Pillars ({', '.join(current_pillars.values_list('full_name', flat=True))})."
+                    },
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        if new_role == 'station_mobilizer':
+            if station:
+                current_mobs = Member.objects.filter(
+                    campaign_role='station_mobilizer',
+                    assigned_polling_centre__iexact=station,
+                    is_active=True
+                ).exclude(id=member.id)
+                if current_mobs.count() >= 25:
+                    return response.Response(
+                        {
+                            "warning": "quota_full",
+                            "error": f"Station '{station}' has reached its target of 25 mobilizers ({current_mobs.count()} registered). Reassign or transfer existing mobilizer."
+                        },
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+
+        # Update member
+        member.campaign_role = new_role
+        if sub_county:
+            member.assigned_sub_county = sub_county
+        if ward:
+            member.assigned_ward = ward
+        if station:
+            member.assigned_polling_centre = station
+        if pillar_category:
+            member.pillar_category = pillar_category
+
+        # Set supervisor to caller if not set
+        if not member.supervisor and request.user.id != member.id:
+            member.supervisor = request.user
+
+        # If appointed as Governor or County Manager, set is_admin=True
+        if new_role in ['governor', 'county_manager']:
+            member.is_admin = True
+            member.is_staff = True
+
+        member.save()
+
+        AuditLog.log(
+            'ROLE_ASSIGNED',
+            user=request.user,
+            request=request,
+            details={
+                'target_member_id': member.id,
+                'target_name': member.full_name,
+                'assigned_role': new_role,
+                'station': station,
+                'ward': ward,
+                'pillar_category': pillar_category
+            }
+        )
+
+        return response.Response({
+            "status": "success",
+            "message": f"Successfully assigned {member.full_name} as {member.get_campaign_role_display()}.",
+            "member": CampaignPersonnelSerializer(member).data
+        })
+
+
+class ConvertToMobilizerView(views.APIView):
+    """
+    Converts one or multiple social / online recruits into Polling Station Mobilizers.
+    Sets source='field_mobilizer', campaign_role='station_mobilizer', and ensures they have mobilizer privileges.
+    """
+    permission_classes = [IsAdminUser]
+
+    def post(self, request):
+        member_ids = request.data.get('member_ids', [])
+        single_id = request.data.get('member_id')
+        
+        if single_id:
+            member_ids.append(single_id)
+
+        if not member_ids:
+            return response.Response(
+                {"error": "At least one member_id or member_ids array is required."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        members = Member.objects.filter(id__in=member_ids, is_active=True)
+        count = 0
+        names = []
+
+        for m in members:
+            m.source = 'field_mobilizer'
+            m.campaign_role = 'station_mobilizer'
+            if not m.assigned_ward and m.ward:
+                m.assigned_ward = m.ward
+            if not m.assigned_polling_centre and m.polling_station:
+                m.assigned_polling_centre = m.polling_station
+            m.save()
+            count += 1
+            names.append(m.full_name)
+
+        AuditLog.log(
+            'CONVERT_TO_MOBILIZER',
+            user=request.user,
+            request=request,
+            details={
+                'member_ids': member_ids,
+                'converted_count': count,
+                'names': names
+            }
+        )
+
+        return response.Response({
+            "status": "success",
+            "converted_count": count,
+            "message": f"Successfully moved {count} recruit(s) to Mobilizer status.",
+            "names": names
+        })

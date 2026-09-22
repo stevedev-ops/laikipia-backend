@@ -21,6 +21,7 @@ class MemberSerializer(serializers.ModelSerializer):
     referral_code = serializers.ReadOnlyField()
     recruits_count = serializers.SerializerMethodField()
     referrer_name = serializers.CharField(source='referred_by.full_name', read_only=True)
+    supervisor_name = serializers.CharField(source='supervisor.full_name', read_only=True)
     is_agent = serializers.SerializerMethodField()
     agent_assignment = serializers.SerializerMethodField()
 
@@ -33,7 +34,9 @@ class MemberSerializer(serializers.ModelSerializer):
             'referral_code', 'referred_by', 'is_voter_verified', 'created_at',
             'recruits_count', 'referrer_name', 'is_admin', 'is_staff', 'is_security', 'security_rank', 'is_security_only',
             'is_agent', 'agent_assignment', 'is_active', 'is_opted_out', 'opted_out_at',
-            'supporter_score', 'top_issue', 'source', 'volunteer_role', 'custom_role'
+            'supporter_score', 'top_issue', 'source', 'volunteer_role', 'custom_role',
+            'campaign_role', 'pillar_category', 'assigned_sub_county', 'assigned_ward',
+            'assigned_polling_centre', 'supervisor', 'supervisor_name'
         ]
 
     def get_is_agent(self, obj):
@@ -183,3 +186,21 @@ class CampaignConfigSerializer(serializers.ModelSerializer):
         model = CampaignConfig
         fields = ['id', 'key', 'value', 'updated_at']
 
+
+
+# ─── 7-Tier Campaign Hierarchy Serializer ──────────────────────────────────
+class CampaignPersonnelSerializer(serializers.ModelSerializer):
+    supervisor_name = serializers.CharField(source='supervisor.full_name', read_only=True)
+    recruits_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Member
+        fields = [
+            'id', 'uuid', 'full_name', 'phone', 'national_id', 'campaign_role', 'pillar_category',
+            'assigned_sub_county', 'assigned_ward', 'assigned_polling_centre',
+            'ward', 'polling_station', 'is_active', 'is_admin', 'created_at',
+            'supervisor', 'supervisor_name', 'recruits_count'
+        ]
+
+    def get_recruits_count(self, obj):
+        return obj.recruits.count()

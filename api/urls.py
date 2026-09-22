@@ -2,6 +2,8 @@ from django.urls import path
 from . import views
 
 urlpatterns = [
+    path('admin/change-password', views.AdminChangePasswordView.as_view(), name='admin-change-password'),
+
     path('functions', views.CampaignFunctionListView.as_view(), name='function-list'),
     path('functions/<int:pk>', views.CampaignFunctionDetailView.as_view(), name='function-detail'),
     path('members/<int:pk>/toggle-active/', views.MemberToggleActiveView.as_view(), name='toggle-member-active'),
@@ -69,4 +71,11 @@ urlpatterns = [
     path('security-logs/<int:pk>', views.SecurityLogDetailView.as_view(), name='security-logs-detail'),
     path('security-personnel', views.SecurityPersonnelListView.as_view(), name='security-personnel-list'),
     path('security-mia', views.SecurityMIAView.as_view(), name='security-mia'),
+    # 7-Tier Campaign Hierarchy Routes
+    path('hierarchy/stats', views.CampaignHierarchyStatsView.as_view(), name='hierarchy-stats'),
+    path('hierarchy/tree', views.CampaignHierarchyTreeView.as_view(), name='hierarchy-tree'),
+    path('hierarchy/directory', views.CampaignDirectoryView.as_view(), name='hierarchy-directory'),
+    path('hierarchy/my-team', views.CampaignMyTeamView.as_view(), name='hierarchy-my-team'),
+    path('hierarchy/assign', views.CampaignAssignRoleView.as_view(), name='hierarchy-assign'),
+    path('members/convert-to-mobilizer', views.ConvertToMobilizerView.as_view(), name='convert-to-mobilizer'),
 ]
