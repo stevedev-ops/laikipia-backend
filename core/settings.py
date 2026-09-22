@@ -176,13 +176,13 @@ REST_FRAMEWORK = {
         'rest_framework.throttling.UserRateThrottle'
     ],
     'DEFAULT_THROTTLE_RATES': {
-        'anon': '120/day',
-        'user': '1200/day',
-        'login': '5/minute',
-        'register': '15/minute',
-        'voter_lookup': '30/minute',
-        'claim_social': '15/minute',
-        'export_csv': '25/hour',
+        'anon': '3000/hour',
+        'user': '10000/hour',
+        'login': '20/minute',
+        'register': '30/minute',
+        'voter_lookup': '60/minute',
+        'claim_social': '30/minute',
+        'export_csv': '60/hour',
     }
 }
 
