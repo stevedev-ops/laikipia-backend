@@ -2608,14 +2608,36 @@ class CampaignMyTeamView(views.APIView):
 
 class CampaignAssignRoleView(views.APIView):
     """
-    Appoint, promote, or assign a member to a specific campaign tier.
-    Enforces strict cascading management authority and quotas:
-      - Governor / County Manager: County-wide authority
-      - Sub-County Coordinator: Only within assigned sub-county (appoints Ward Coordinators)
-      - Ward Coordinator: Only within assigned ward (appoints Polling Centre Coordinators)
-      - Polling Centre Coordinator: Only at assigned station (appoints 3 Pillars & 25 Mobilizers)
+    Assigns or updates a member's campaign role and jurisdiction.
+    Enforces strict cascading command hierarchy:
+    - Super Admin / Governor / County Manager: County-wide authority to appoint anyone to any level.
+    - Sub-County Coordinator: Can appoint Ward Coordinators & Polling Centre Coordinators in their Sub-County.
+    - Ward Coordinator: Can appoint Polling Centre Coordinators, Pillars, and Mobilizers in their Ward.
+    - Polling Centre Coordinator: Can appoint 3 Pillars and 25 Mobilizers for their Polling Centre.
+
+    Auto-locks the appointee's jurisdiction to their verified IEBC registration data.
     """
     permission_classes = [IsAuthenticated]
+
+    WARD_TO_SUBCOUNTY = {
+        'nanyuki': 'Laikipia East',
+        'thingithu': 'Laikipia East',
+        'ngobit': 'Laikipia East',
+        'tigithi': 'Laikipia East',
+        'umande': 'Laikipia East',
+        'ol moran': 'Laikipia West',
+        'ol-moran': 'Laikipia West',
+        'rumuruti township': 'Laikipia West',
+        'rumuruti': 'Laikipia West',
+        'githiga': 'Laikipia West',
+        'marmanet': 'Laikipia West',
+        'igwamiti': 'Laikipia West',
+        'salama': 'Laikipia West',
+        'mukogodo east': 'Laikipia North',
+        'mukogodo west': 'Laikipia North',
+        'segera': 'Laikipia North',
+        'sosian': 'Laikipia North'
+    }
 
     def post(self, request):
         caller = request.user
@@ -2625,9 +2647,9 @@ class CampaignAssignRoleView(views.APIView):
         data = request.data
         member_id = data.get('member_id')
         new_role = data.get('campaign_role')
-        sub_county = data.get('assigned_sub_county', '').strip()
-        ward = data.get('assigned_ward', '').strip()
-        station = data.get('assigned_polling_centre', '').strip()
+        custom_sub_county = data.get('assigned_sub_county', '').strip()
+        custom_ward = data.get('assigned_ward', '').strip()
+        custom_station = data.get('assigned_polling_centre', '').strip()
         pillar_category = data.get('pillar_category', 'none').strip()
 
         if not member_id or not new_role:
@@ -2650,21 +2672,33 @@ class CampaignAssignRoleView(views.APIView):
                 status=status.HTTP_404_NOT_FOUND
             )
 
+        # Candidate's verified IEBC location data
+        iebc_ward = (member.official_ward or member.ward or '').strip()
+        iebc_station = (member.official_polling_station or member.polling_station or '').strip()
+        iebc_subcounty = self.WARD_TO_SUBCOUNTY.get(iebc_ward.lower(), '') if iebc_ward else ''
+
+        # Determine target jurisdiction (Defaults automatically to their IEBC registered location)
+        sub_county = custom_sub_county or iebc_subcounty or getattr(member, 'assigned_sub_county', '')
+        ward = custom_ward or iebc_ward or getattr(member, 'assigned_ward', '')
+        station = custom_station or iebc_station or getattr(member, 'assigned_polling_centre', '')
+
         # ─── Strict Cascading Authority Enforcement ────────────────────────────
         if not is_caller_admin and caller_role not in ['governor', 'county_manager']:
             if caller_role == 'sub_county_coordinator':
-                caller_sc = (caller.assigned_sub_county or '').strip()
+                caller_sc = (caller.assigned_sub_county or self.WARD_TO_SUBCOUNTY.get((caller.assigned_ward or caller.ward or '').lower(), '')).strip()
                 if new_role not in ['ward_coordinator', 'polling_centre_coordinator']:
                     return response.Response(
                         {"error": "Sub-County Coordinators can only appoint Ward Coordinators or Polling Centre Coordinators."},
                         status=status.HTTP_403_FORBIDDEN
                     )
-                if sub_county and caller_sc and sub_county.lower() != caller_sc.lower():
+                # Verify candidate is in caller's Sub-County
+                candidate_sc = iebc_subcounty or sub_county
+                if candidate_sc and caller_sc and candidate_sc.lower() != caller_sc.lower():
                     return response.Response(
-                        {"error": f"Access Denied: You can only appoint leaders within your assigned Sub-County ({caller_sc})."},
+                        {"error": f"Access Denied: Candidate's IEBC Sub-County ({candidate_sc}) does not match your assigned Sub-County ({caller_sc})."},
                         status=status.HTTP_403_FORBIDDEN
                     )
-                sub_county = caller_sc # Auto-lock to caller's jurisdiction
+                sub_county = caller_sc
 
             elif caller_role == 'ward_coordinator':
                 caller_ward = (caller.assigned_ward or caller.ward or '').strip()
@@ -2673,12 +2707,15 @@ class CampaignAssignRoleView(views.APIView):
                         {"error": "Ward Coordinators can only appoint Polling Centre Coordinators, Pillars, or Mobilizers."},
                         status=status.HTTP_403_FORBIDDEN
                     )
-                if ward and caller_ward and ward.lower() != caller_ward.lower():
+                # Candidate MUST be registered in caller's Ward
+                candidate_ward = iebc_ward or ward
+                if candidate_ward and caller_ward and candidate_ward.lower() != caller_ward.lower():
                     return response.Response(
-                        {"error": f"Access Denied: You can only appoint coordinators within your assigned Ward ({caller_ward})."},
+                        {"error": f"Access Denied: Candidate is registered in {candidate_ward} Ward, but you are the coordinator for {caller_ward} Ward."},
                         status=status.HTTP_403_FORBIDDEN
                     )
-                ward = caller_ward # Auto-lock to caller's ward
+                ward = caller_ward
+                sub_county = self.WARD_TO_SUBCOUNTY.get(ward.lower(), sub_county)
 
             elif caller_role == 'polling_centre_coordinator':
                 caller_station = (caller.assigned_polling_centre or caller.polling_station or '').strip()
@@ -2688,14 +2725,16 @@ class CampaignAssignRoleView(views.APIView):
                         {"error": "Polling Centre Coordinators can only appoint their 3 Pillars or 25 Mobilizers."},
                         status=status.HTTP_403_FORBIDDEN
                     )
-                if station and caller_station and station.lower() != caller_station.lower():
+                # Candidate MUST be registered in caller's Polling Centre
+                candidate_station = iebc_station or station
+                if candidate_station and caller_station and candidate_station.lower() != caller_station.lower():
                     return response.Response(
-                        {"error": f"Access Denied: You can only appoint personnel for your assigned Polling Centre ({caller_station})."},
+                        {"error": f"Access Denied: Candidate is registered at '{candidate_station}', but you manage '{caller_station}'."},
                         status=status.HTTP_403_FORBIDDEN
                     )
-                station = caller_station # Auto-lock to caller's station
-                if not ward:
-                    ward = caller_ward
+                station = caller_station
+                ward = caller_ward
+                sub_county = self.WARD_TO_SUBCOUNTY.get(ward.lower(), sub_county)
 
             else:
                 return response.Response(
@@ -2703,11 +2742,27 @@ class CampaignAssignRoleView(views.APIView):
                     status=status.HTTP_403_FORBIDDEN
                 )
 
+        # Role-specific jurisdiction bindings
+        if new_role == 'ward_coordinator':
+            if not ward and iebc_ward:
+                ward = iebc_ward
+            if not sub_county and ward:
+                sub_county = self.WARD_TO_SUBCOUNTY.get(ward.lower(), '')
+
+        elif new_role == 'polling_centre_coordinator':
+            if not station and iebc_station:
+                station = iebc_station
+            if not ward and iebc_ward:
+                ward = iebc_ward
+            if not sub_county and ward:
+                sub_county = self.WARD_TO_SUBCOUNTY.get(ward.lower(), '')
+
         # Quota Validation Checks
         if new_role == 'pillar':
-            if not station:
+            target_station = station or iebc_station
+            if not target_station:
                 return response.Response(
-                    {"error": "Assigned Polling Centre is required for a Campaign Pillar."},
+                    {"error": "Assigned Polling Centre / IEBC Polling Station is required for a Campaign Pillar."},
                     status=status.HTTP_400_BAD_REQUEST
                 )
             if pillar_category not in ['youth', 'women', 'elders_business', 'special_interest']:
@@ -2715,32 +2770,32 @@ class CampaignAssignRoleView(views.APIView):
                     {"error": "A valid pillar category (youth, women, elders_business, special_interest) is required."},
                     status=status.HTTP_400_BAD_REQUEST
                 )
-            # Check maximum 3 pillars for this station
             current_pillars = Member.objects.filter(
                 campaign_role='pillar',
-                assigned_polling_centre__iexact=station,
+                assigned_polling_centre__iexact=target_station,
                 is_active=True
             ).exclude(id=member.id)
             if current_pillars.count() >= 3:
                 return response.Response(
                     {
-                        "error": f"Quota Exceeded: Polling Station '{station}' already has 3 assigned Pillars ({', '.join(current_pillars.values_list('full_name', flat=True))})."
+                        "error": f"Quota Exceeded: Polling Station '{target_station}' already has 3 assigned Pillars ({', '.join(current_pillars.values_list('full_name', flat=True))})."
                     },
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
         if new_role == 'station_mobilizer':
-            if station:
+            target_station = station or iebc_station
+            if target_station:
                 current_mobs = Member.objects.filter(
                     campaign_role='station_mobilizer',
-                    assigned_polling_centre__iexact=station,
+                    assigned_polling_centre__iexact=target_station,
                     is_active=True
                 ).exclude(id=member.id)
                 if current_mobs.count() >= 25:
                     return response.Response(
                         {
                             "warning": "quota_full",
-                            "error": f"Station '{station}' has reached its target of 25 mobilizers ({current_mobs.count()} registered). Reassign or transfer existing mobilizer."
+                            "error": f"Station '{target_station}' has reached its target of 25 mobilizers ({current_mobs.count()} registered)."
                         },
                         status=status.HTTP_400_BAD_REQUEST
                     )
@@ -2760,7 +2815,7 @@ class CampaignAssignRoleView(views.APIView):
         if not member.supervisor and request.user.id != member.id:
             member.supervisor = request.user
 
-        # If appointed as Governor or County Manager, set is_admin=True
+        # If appointed as Governor or County Manager, grant admin privileges
         if new_role in ['governor', 'county_manager']:
             member.is_admin = True
             member.is_staff = True
@@ -2775,15 +2830,16 @@ class CampaignAssignRoleView(views.APIView):
                 'target_member_id': member.id,
                 'target_name': member.full_name,
                 'assigned_role': new_role,
-                'station': station,
-                'ward': ward,
+                'sub_county': member.assigned_sub_county,
+                'ward': member.assigned_ward,
+                'station': member.assigned_polling_centre,
                 'pillar_category': pillar_category
             }
         )
 
         return response.Response({
             "status": "success",
-            "message": f"Successfully assigned {member.full_name} as {member.get_campaign_role_display()}.",
+            "message": f"Successfully assigned {member.full_name} as {member.get_campaign_role_display()} for {member.assigned_ward or member.assigned_sub_county or 'County'}.",
             "member": CampaignPersonnelSerializer(member).data
         })
 
