@@ -204,3 +204,27 @@ class CampaignPersonnelSerializer(serializers.ModelSerializer):
 
     def get_recruits_count(self, obj):
         return obj.recruits.count()
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        request = self.context.get('request') if hasattr(self, 'context') and self.context else None
+        user = getattr(request, 'user', None) if request else None
+
+        is_admin_or_county_ops = False
+        if user and user.is_authenticated:
+            is_admin_or_county_ops = (
+                getattr(user, 'is_admin', False) or 
+                getattr(user, 'is_staff', False) or 
+                getattr(user, 'is_superuser', False) or 
+                getattr(user, 'campaign_role', '') in ['governor', 'county_manager']
+            )
+            # A member can always view their own contact details
+            if getattr(user, 'id', None) == getattr(instance, 'id', None):
+                is_admin_or_county_ops = True
+
+        # For anyone other than Admin / County Operations, hide downward phone numbers & national IDs
+        if not is_admin_or_county_ops:
+            data['phone'] = ''
+            data['national_id'] = ''
+
+        return data

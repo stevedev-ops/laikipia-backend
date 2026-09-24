@@ -6,3 +6,4 @@ staticfiles/
 datadump.json
 iebc_data/Laikipia County/
 iebc_data/Laikipia Combined.xlsx
+*.json
