@@ -463,13 +463,22 @@ class MemberListView(generics.ListCreateAPIView):
         search = self.request.query_params.get('search')
         if search and search.strip() and search.strip() != 'undefined':
             search = search.strip()
-            if search.isdigit():
-                queryset = queryset.filter(Q(national_id__icontains=search))
+            digits_only = re.sub(r'\D', '', search)
+            if search.isdigit() and len(search) <= 8 and not search.startswith(('07', '01', '254')):
+                queryset = queryset.filter(Q(national_id__icontains=search) | Q(phone__icontains=search))
+            elif digits_only and (search.startswith(('07', '01', '254', '+254')) or len(digits_only) >= 9):
+                queryset = queryset.filter(Q(phone__icontains=digits_only[-9:]) | Q(national_id__icontains=search))
             else:
                 name_parts = [p for p in search.split(' ') if p]
                 for part in name_parts:
                     queryset = queryset.filter(
-                        Q(full_name__icontains=part) | Q(national_id__icontains=part)
+                        Q(full_name__icontains=part) |
+                        Q(national_id__icontains=part) |
+                        Q(phone__icontains=part) |
+                        Q(ward__icontains=part) |
+                        Q(official_ward__icontains=part) |
+                        Q(polling_station__icontains=part) |
+                        Q(official_polling_station__icontains=part)
                     )
         
         voter_status = self.request.query_params.get('voter_status')
@@ -558,6 +567,7 @@ class MemberExportCsvView(views.APIView):
             qs = qs.filter(is_opted_out=False)
 
         response_file = HttpResponse(content_type='text/csv; charset=utf-8')
+        response_file.write('\ufeff') # Prepend UTF-8 BOM so Excel opens with proper encoding
         ward_label = ward.replace(' ', '_').lower() if ward and ward.lower() != 'all' else 'all_wards'
         source_label = f"_{source.lower()}" if source and source.lower() != 'all' else ("_all_channels" if is_digital == 'true' else "")
         filename = f"dcp_members_call_sms{source_label}_{ward_label}_{timezone.now().strftime('%Y%m%d_%H%M')}.csv"
@@ -583,9 +593,28 @@ class MemberExportCsvView(views.APIView):
         rows_count = 0
         for m in qs.order_by('ward', 'full_name'):
             rows_count += 1
+            
+            # Format Kenyan phone number to prevent scientific notation in Excel
+            phone_str = str(m.phone or '').strip()
+            digits = re.sub(r'\D', '', phone_str)
+            if digits.startswith('254') and len(digits) == 12:
+                digits = '0' + digits[3:]
+            elif len(digits) == 9 and digits.startswith(('7', '1')):
+                digits = '0' + digits
+            
+            if len(digits) == 10 and digits.startswith(('07', '01')):
+                formatted_phone = f'{digits[:4]} {digits[4:7]} {digits[7:]}'
+                phone_cell = f'="{formatted_phone}"'
+            elif phone_str:
+                phone_cell = f'="{phone_str}"'
+            else:
+                phone_cell = ''
+
+            id_cell = f'="{m.national_id}"' if m.national_id else ''
+
             writer.writerow([
                 m.full_name,
-                m.phone,
+                phone_cell,
                 m.official_ward or m.ward or '',
                 m.official_polling_station or m.polling_station or '',
                 m.source or 'field_mobilizer',
@@ -594,7 +623,7 @@ class MemberExportCsvView(views.APIView):
                 m.referred_by.full_name if m.referred_by else 'Root / Direct',
                 'Yes' if m.is_voter_verified else 'No',
                 'Opted Out (DPA Restricted)' if m.is_opted_out else 'Active Consent',
-                m.national_id or '',
+                id_cell,
                 m.created_at.strftime('%Y-%m-%d %H:%M') if m.created_at else ''
             ])
 
@@ -2864,7 +2893,10 @@ class CampaignDirectoryView(views.APIView):
                 )
 
         if role:
-            members = members.filter(campaign_role=role)
+            if role == 'station_mobilizer':
+                members = members.filter(Q(campaign_role='station_mobilizer') | Q(campaign_role='') | Q(campaign_role__isnull=True))
+            else:
+                members = members.filter(campaign_role=role)
         if sc:
             sc_wards = get_jurisdiction_wards(sub_county=sc)
             members = members.filter(Q(assigned_sub_county__iexact=sc) | Q(assigned_ward__in=sc_wards) | Q(ward__in=sc_wards) | Q(campaign_role__in=['governor', 'county_manager']))
