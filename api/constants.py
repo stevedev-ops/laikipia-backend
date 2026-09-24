@@ -50,3 +50,19 @@ PILLAR_CATEGORIES = [
     ('elders_business', 'Elders & Business Pillar'),
     ('special_interest', 'Special Interest Pillar'),
 ]
+
+import re
+
+def clean_centre_name(station_name):
+    if not station_name:
+        return ""
+    name = str(station_name).strip()
+    # 1. Remove parenthesized (Station 01), (Stream 1), (Station 1), (01), (1), etc.
+    name = re.sub(r'\s*\((?:Station|Stream|Stn|Str)?\s*\d+\)', '', name, flags=re.IGNORECASE)
+    # 2. Remove trailing stream/station suffixes with separators: " Station 01", " · Stream 02", " - 01", " 01", " 02", ": Stream 1"
+    name = re.sub(r'\s*(?:[-/|•·:]\s*)?(?:Station|Stream|Stn|Str)?\s*\d+\s*$', '', name, flags=re.IGNORECASE)
+    # 3. Strip trailing stream or station words if left over
+    name = re.sub(r'\s*(?:[-/|•·:]\s*)?(?:Station|Stream|Stn|Str)\s*$', '', name, flags=re.IGNORECASE)
+    # 4. Strip any remaining dangling separators at end
+    name = re.sub(r'[\s\-/|•·:]+$', '', name)
+    return name.strip()
