@@ -1,3 +1,37 @@
+
+from .constants import (
+    CONSTITUENCIES,
+    SUBCOUNTY_TO_WARDS,
+    WARD_TO_SUBCOUNTY,
+    ALL_LAIKIPIA_WARDS,
+)
+
+def get_jurisdiction_wards(sub_county=None, ward=None):
+    if ward and ward.strip() and ward.strip().lower() != 'all':
+        return [ward.strip()]
+    if sub_county and sub_county.strip():
+        sc = sub_county.strip().lower()
+        for k, v in SUBCOUNTY_TO_WARDS.items():
+            if k.lower() == sc or k.lower() in sc or sc in k.lower():
+                return v
+    return []
+
+import re
+
+def clean_centre_name(station_name):
+    if not station_name:
+        return ""
+    name = str(station_name).strip()
+    # 1. Remove parenthesized (Station 01), (Stream 1), (Station 1), (01), (1), etc.
+    name = re.sub(r'\s*\((?:Station|Stream|Stn|Str)?\s*\d+\)', '', name, flags=re.IGNORECASE)
+    # 2. Remove trailing stream/station suffixes with separators: " Station 01", " · Stream 02", " - 01", " 01", " 02", ": Stream 1"
+    name = re.sub(r'\s*(?:[-/|•·:]\s*)?(?:Station|Stream|Stn|Str)?\s*\d+\s*$', '', name, flags=re.IGNORECASE)
+    # 3. Strip trailing stream or station words if left over
+    name = re.sub(r'\s*(?:[-/|•·:]\s*)?(?:Station|Stream|Stn|Str)\s*$', '', name, flags=re.IGNORECASE)
+    # 4. Strip any remaining dangling separators at end
+    name = re.sub(r'[\s\-/|•·:]+$', '', name)
+    return name.strip()
+
 import csv
 from django.http import HttpResponse
 from django.utils import timezone
@@ -394,12 +428,40 @@ class MemberListView(generics.ListCreateAPIView):
         # ALWAYS filter out admins and staff from the public member lists
         queryset = queryset.filter(is_admin=False, is_staff=False)
 
-        if not self.request.user.is_admin:
-            # Regular users can only see their direct recruits
-            queryset = queryset.filter(referred_by=self.request.user)
+        user = self.request.user
+        if not (getattr(user, 'is_admin', False) or getattr(user, 'is_staff', False) or getattr(user, 'campaign_role', '') in ['governor', 'county_manager']):
+            role = getattr(user, 'campaign_role', 'station_mobilizer')
+            if role == 'sub_county_coordinator':
+                sc = user.assigned_sub_county or ''
+                wards = get_jurisdiction_wards(sub_county=sc)
+                if wards:
+                    queryset = queryset.filter(Q(referred_by=user) | Q(ward__in=wards) | Q(official_ward__in=wards) | Q(assigned_ward__in=wards) | Q(assigned_sub_county__iexact=sc) | Q(assigned_sub_county__iexact=sc))
+                elif sc:
+                    queryset = queryset.filter(Q(referred_by=user) | Q(assigned_sub_county__iexact=sc) | Q(assigned_sub_county__iexact=sc))
+                else:
+                    queryset = queryset.filter(referred_by=user)
+            elif role == 'ward_coordinator':
+                w = user.assigned_ward or user.ward or ''
+                if w:
+                    queryset = queryset.filter(Q(referred_by=user) | Q(assigned_ward__iexact=w) | Q(ward__iexact=w) | Q(official_ward__iexact=w))
+                else:
+                    queryset = queryset.filter(referred_by=user)
+            elif role in ['polling_centre_coordinator', 'pillar']:
+                st = user.assigned_polling_centre or user.polling_station or ''
+                w = user.assigned_ward or user.ward or ''
+                base_st = clean_centre_name(st) if st else ''
+                cond = Q(referred_by=user)
+                if base_st:
+                    cond |= Q(assigned_polling_centre__icontains=base_st) | Q(polling_station__icontains=base_st) | Q(official_polling_station__icontains=base_st)
+                if w:
+                    cond |= Q(assigned_ward__iexact=w) | Q(ward__iexact=w) | Q(official_ward__iexact=w)
+                queryset = queryset.filter(cond)
+            else:
+                # Regular grassroots mobilizer sees their direct recruits & downline
+                queryset = queryset.filter(referred_by=user)
         
         search = self.request.query_params.get('search')
-        if search:
+        if search and search.strip() and search.strip() != 'undefined':
             search = search.strip()
             if search.isdigit():
                 queryset = queryset.filter(Q(national_id__icontains=search))
@@ -591,7 +653,7 @@ class VoterRecordListView(generics.ListAPIView):
     def get_queryset(self):
         queryset = super().get_queryset()
         search = self.request.query_params.get('search')
-        if search:
+        if search and search.strip() and search.strip() != 'undefined':
             search = search.strip()
             if search.isdigit():
                 queryset = queryset.filter(
@@ -1591,25 +1653,29 @@ LAIKIPIA_WEST_STATIONS = {
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def get_wards_and_stations(request):
-    """Returns a dictionary mapping all Laikipia Wards to their unique Polling Stations directly from the official voter register."""
+    """Returns a dictionary mapping all Laikipia Wards to their unique clean Polling Centres (Schools/Centres)."""
     mapping = {}
     wards_data = VoterRecord.objects.values('ward', 'polling_station').distinct().order_by('ward', 'polling_station')
     for entry in wards_data:
         ward = entry.get('ward')
-        station = entry.get('polling_station')
-        if not ward:
+        raw_station = entry.get('polling_station')
+        if not ward or not raw_station:
             continue
             
+        station = clean_centre_name(raw_station)
+        if not station:
+            continue
+
         if ward not in mapping:
             mapping[ward] = []
             
-        if station and station not in mapping[ward]:
+        if station not in mapping[ward]:
             mapping[ward].append(station)
             
     if not mapping:
-        mapping = {k: list(v) for k, v in LAIKIPIA_WEST_STATIONS.items()}
+        mapping = {k: [clean_centre_name(s) for s in v] for k, v in LAIKIPIA_WEST_STATIONS.items()}
 
-    sorted_mapping = {w: sorted(s) for w, s in sorted(mapping.items())}
+    sorted_mapping = {w: sorted(list(set(s))) for w, s in sorted(mapping.items())}
     return response.Response(sorted_mapping)
 
 
@@ -2076,12 +2142,47 @@ from .serializers import CampaignFunctionSerializer
 class CampaignFunctionListView(views.APIView):
     permission_classes = [IsAuthenticated]
 
-    def get(self, request):
-        qs = CampaignFunction.objects.all().select_related('submitted_by')
+    def _is_admin(self, user):
+        return bool(
+            getattr(user, 'is_admin', False) or
+            getattr(user, 'is_staff', False) or
+            getattr(user, 'is_superuser', False) or
+            getattr(user, 'campaign_role', '') in ['governor', 'county_manager']
+        )
 
-        # Privacy Scoping: Mobilizers only see functions they personally submitted OR official Governor rallies
-        if not request.user.is_admin:
-            qs = qs.filter(Q(submitted_by=request.user) | Q(is_created_by_governor=True))
+    def get(self, request):
+        qs = CampaignFunction.objects.all().select_related('submitted_by').order_by('-event_date', '-created_at')
+        user = request.user
+        is_admin_user = self._is_admin(user)
+        user_role = getattr(user, 'campaign_role', 'station_mobilizer')
+        user_sc = getattr(user, 'assigned_sub_county', '') or ''
+        user_ward = getattr(user, 'assigned_ward', '') or getattr(user, 'ward', '') or ''
+
+        # ─── Strict Hierarchical Jurisdiction Scoping ─────────────────
+        if not is_admin_user:
+            if user_role == 'sub_county_coordinator' and user_sc:
+                sc_wards = get_jurisdiction_wards(sub_county=user_sc)
+                qs = qs.filter(
+                    Q(constituency__iexact=user_sc) | 
+                    Q(ward__in=sc_wards) | 
+                    Q(submitted_by=user) | 
+                    Q(is_created_by_governor=True)
+                )
+            elif user_role == 'ward_coordinator' and user_ward:
+                qs = qs.filter(
+                    Q(ward__iexact=user_ward) | 
+                    Q(submitted_by=user) | 
+                    Q(is_created_by_governor=True)
+                )
+            else: # Polling Centre Coordinator, Pillar, Station Mobilizer
+                if user_ward:
+                    qs = qs.filter(
+                        Q(submitted_by=user) | 
+                        (Q(ward__iexact=user_ward) & Q(status__in=['attending', 'delegated'])) | 
+                        Q(is_created_by_governor=True)
+                    )
+                else:
+                    qs = qs.filter(Q(submitted_by=user) | Q(is_created_by_governor=True))
 
         constituency = request.query_params.get('constituency')
         if constituency and constituency != 'all':
@@ -2099,22 +2200,28 @@ class CampaignFunctionListView(views.APIView):
         if event_type and event_type != 'all':
             qs = qs.filter(event_type=event_type)
 
-        # Access rule:
-        # Admins/Secretariat: see everything
-        # Regular Mobilizers: see confirmed/delegated events + all events they submitted themselves
-        if not request.user.is_admin:
-            qs = qs.filter(Q(status__in=['attending', 'delegated']) | Q(submitted_by=request.user))
+        date_filter = request.query_params.get('date', '').strip()
+        if date_filter and date_filter != 'all':
+            qs = qs.filter(event_date=date_filter)
+
+        # ─── Timeline / Past vs Upcoming History Filtering ──────────
+        timeline = request.query_params.get('timeline', '').strip()
+        today = timezone.now().date()
+        if timeline == 'upcoming':
+            qs = qs.filter(event_date__gte=today).order_by('event_date', 'start_time')
+        elif timeline == 'history':
+            qs = qs.filter(event_date__lt=today).order_by('-event_date', '-created_at')
 
         serializer = CampaignFunctionSerializer(qs, many=True, context={'request': request})
         return response.Response(serializer.data)
 
     def post(self, request):
         data = request.data.copy()
-        is_admin = request.user.is_admin or request.user.is_staff or request.user.is_superuser
+        is_admin_user = self._is_admin(request.user)
 
-        if is_admin:
+        if is_admin_user:
             data['is_created_by_governor'] = True
-            if 'status' not in data:
+            if 'status' not in data or not data['status']:
                 data['status'] = 'attending'
         else:
             data['is_created_by_governor'] = False
@@ -2133,13 +2240,22 @@ class CampaignFunctionListView(views.APIView):
 class CampaignFunctionDetailView(views.APIView):
     permission_classes = [IsAuthenticated]
 
+    def _is_admin(self, user):
+        return bool(
+            getattr(user, 'is_admin', False) or
+            getattr(user, 'is_staff', False) or
+            getattr(user, 'is_superuser', False) or
+            getattr(user, 'campaign_role', '') in ['governor', 'county_manager']
+        )
+
     def get(self, request, pk):
         try:
             func = CampaignFunction.objects.select_related('submitted_by').get(pk=pk)
         except CampaignFunction.DoesNotExist:
             return response.Response({'error': 'Function not found'}, status=status.HTTP_404_NOT_FOUND)
 
-        if not request.user.is_admin and func.status not in ['attending', 'delegated'] and func.submitted_by_id != request.user.id:
+        is_admin_user = self._is_admin(request.user)
+        if not is_admin_user and func.status not in ['attending', 'delegated'] and func.submitted_by_id != request.user.id:
             return response.Response({'error': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
 
         serializer = CampaignFunctionSerializer(func, context={'request': request})
@@ -2151,15 +2267,15 @@ class CampaignFunctionDetailView(views.APIView):
         except CampaignFunction.DoesNotExist:
             return response.Response({'error': 'Function not found'}, status=status.HTTP_404_NOT_FOUND)
 
-        is_admin = request.user.is_admin or request.user.is_staff or request.user.is_superuser
+        is_admin_user = self._is_admin(request.user)
         is_submitter = (func.submitted_by_id == request.user.id)
 
-        if not is_admin and not is_submitter:
+        if not is_admin_user and not is_submitter:
             return response.Response({'error': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
 
         data = request.data.copy()
         # Non-admins cannot change status or delegate
-        if not is_admin:
+        if not is_admin_user:
             data.pop('status', None)
             data.pop('delegate_name', None)
             data.pop('delegate_phone', None)
@@ -2172,7 +2288,7 @@ class CampaignFunctionDetailView(views.APIView):
         return response.Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
     def delete(self, request, pk):
-        if not request.user.is_admin:
+        if not self._is_admin(request.user):
             return response.Response({'error': 'Admin privileges required'}, status=status.HTTP_403_FORBIDDEN)
         try:
             func = CampaignFunction.objects.get(pk=pk)
@@ -2349,46 +2465,139 @@ class AdminChangePasswordView(views.APIView):
 # ─── 7-Tier Campaign Hierarchy & Command Views ─────────────────────────────────
 
 class CampaignHierarchyStatsView(views.APIView):
-    """High-level role counts, quotas, and health breakdown across the campaign."""
+    """
+    High-level role counts, quotas, and health breakdown across the campaign.
+    Dynamically scopes based on requested sub_county, ward, station, or authenticated user authority.
+    """
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        counts = {
-            'governor': Member.objects.filter(campaign_role='governor', is_active=True).count(),
-            'county_manager': Member.objects.filter(campaign_role='county_manager', is_active=True).count(),
-            'sub_county_coordinator': Member.objects.filter(campaign_role='sub_county_coordinator', is_active=True).count(),
-            'ward_coordinator': Member.objects.filter(campaign_role='ward_coordinator', is_active=True).count(),
-            'polling_centre_coordinator': Member.objects.filter(campaign_role='polling_centre_coordinator', is_active=True).count(),
-            'pillar': Member.objects.filter(campaign_role='pillar', is_active=True).count(),
-            'station_mobilizer': Member.objects.filter(campaign_role='station_mobilizer', is_active=True).count(),
-            'total_personnel': Member.objects.filter(is_active=True).count(),
-        }
-        pillar_counts = {
-            'youth': Member.objects.filter(campaign_role='pillar', pillar_category='youth', is_active=True).count(),
-            'women': Member.objects.filter(campaign_role='pillar', pillar_category='women', is_active=True).count(),
-            'elders_business': Member.objects.filter(campaign_role='pillar', pillar_category='elders_business', is_active=True).count(),
-            'special_interest': Member.objects.filter(campaign_role='pillar', pillar_category='special_interest', is_active=True).count(),
-        }
+        user = request.user
+        is_super = getattr(user, 'is_admin', False) or getattr(user, 'is_staff', False) or getattr(user, 'is_superuser', False) or getattr(user, 'campaign_role', '') in ['governor', 'county_manager']
+        user_role = getattr(user, 'campaign_role', 'station_mobilizer')
+        user_sc = getattr(user, 'assigned_sub_county', '') or ''
+        user_ward = getattr(user, 'assigned_ward', '') or getattr(user, 'ward', '') or ''
+        user_station = clean_centre_name(getattr(user, 'assigned_polling_centre', '') or getattr(user, 'polling_station', '') or '')
 
-        # Calculate polling station coverage quota
-        # Distinct polling stations in DB
-        stations = VoterRecord.objects.exclude(polling_station__isnull=True).exclude(polling_station='').values_list('polling_station', flat=True).distinct()
-        total_stations = len(stations) or 1
+        # Param overrides if permitted
+        req_sc = request.query_params.get('sub_county', '').strip()
+        req_ward = request.query_params.get('ward', '').strip()
+        req_station = clean_centre_name(request.query_params.get('station', '').strip())
 
-        # Stations with at least 1 coordinator
-        station_with_coord = Member.objects.filter(campaign_role='polling_centre_coordinator', is_active=True).values_list('assigned_polling_centre', flat=True).distinct().count()
-        # Stations with 3 pillars filled
-        # Stations with 25 mobilizers filled
+        # Determine effective scope
+        eff_sc = None
+        eff_ward = None
+        eff_station = None
+
+        if is_super:
+            eff_sc = req_sc or None
+            eff_ward = req_ward or None
+            eff_station = req_station or None
+        elif user_role == 'sub_county_coordinator':
+            eff_sc = user_sc or 'Laikipia West'
+            eff_ward = req_ward if (req_ward and req_ward in get_jurisdiction_wards(sub_county=eff_sc)) else None
+            eff_station = req_station or None
+        elif user_role == 'ward_coordinator':
+            eff_ward = user_ward
+            eff_sc = user_sc or (WARD_TO_SUBCOUNTY.get(user_ward.lower(), '') if user_ward else None)
+            eff_station = req_station or None
+        else: # Polling Centre Coordinator, Pillar, Mobilizer
+            eff_station = user_station
+            eff_ward = user_ward
+            eff_sc = user_sc
+
+        # Build Scoped QuerySet for grassroots personnel (Tier 4 - 7)
+        qs = Member.objects.filter(is_active=True)
+        if eff_station:
+            qs = qs.filter(Q(assigned_polling_centre__iexact=eff_station) | Q(polling_station__iexact=eff_station) | Q(official_polling_station__iexact=eff_station))
+        elif eff_ward:
+            qs = qs.filter(Q(assigned_ward__iexact=eff_ward) | Q(ward__iexact=eff_ward) | Q(official_ward__iexact=eff_ward))
+        elif eff_sc:
+            sc_wards = get_jurisdiction_wards(sub_county=eff_sc)
+            qs = qs.filter(Q(assigned_sub_county__iexact=eff_sc) | Q(assigned_ward__in=sc_wards) | Q(ward__in=sc_wards) | Q(official_ward__in=sc_wards))
+
+        # 1. Tier 1: Governor Aspirant (Supreme Command)
+        gov_count = Member.objects.filter(campaign_role='governor', is_active=True).count()
+
+        # 2. Tier 2: County Operations Manager
+        cm_count = Member.objects.filter(campaign_role='county_manager', is_active=True).count()
+        if not is_super and cm_count > 1:
+            cm_count = 1 # Shows their direct county manager
+
+        # 3. Tier 3: Sub-County Coordinator (Scoped to constituency)
+        if eff_sc:
+            sc_count = Member.objects.filter(campaign_role='sub_county_coordinator', assigned_sub_county__iexact=eff_sc, is_active=True).count()
+            if sc_count == 0 and eff_ward:
+                sc_count = Member.objects.filter(campaign_role='sub_county_coordinator', is_active=True).filter(Q(assigned_sub_county__iexact=eff_sc) | Q(assigned_ward__iexact=eff_ward) | Q(ward__iexact=eff_ward)).count()
+        else:
+            sc_count = Member.objects.filter(campaign_role='sub_county_coordinator', is_active=True).count()
+
+        # 4. Tier 4: Ward Coordinator
+        if eff_ward:
+            ward_count = Member.objects.filter(campaign_role='ward_coordinator', is_active=True).filter(Q(assigned_ward__iexact=eff_ward) | Q(ward__iexact=eff_ward) | Q(official_ward__iexact=eff_ward)).count()
+        else:
+            ward_count = qs.filter(campaign_role='ward_coordinator').count()
+
+        # 5. Tier 5: Polling Centre Coordinator
+        pcc_count = qs.filter(campaign_role='polling_centre_coordinator').count()
+
+        # 6. Tier 6: Campaign Pillar (3 per centre)
+        pillar_count = qs.filter(campaign_role='pillar').count()
+
+        # 7. Tier 7: Station Mobilizer (25 per station)
+        mob_count = qs.filter(Q(campaign_role='station_mobilizer') | Q(campaign_role='') | Q(campaign_role__isnull=True)).count()
+
+        # Calculate station counts in this scope
+        if eff_station:
+            total_centres = 1
+        elif eff_ward:
+            vr_st = VoterRecord.objects.filter(ward__iexact=eff_ward).exclude(polling_station__isnull=True).exclude(polling_station='').values_list('polling_station', flat=True).distinct()
+            clean_set = set(clean_centre_name(s) for s in vr_st if s)
+            total_centres = len(clean_set) or 1
+        elif eff_sc:
+            sc_wards = get_jurisdiction_wards(sub_county=eff_sc)
+            vr_st = VoterRecord.objects.filter(ward__in=sc_wards).exclude(polling_station__isnull=True).exclude(polling_station='').values_list('polling_station', flat=True).distinct()
+            clean_set = set(clean_centre_name(s) for s in vr_st if s)
+            total_centres = len(clean_set) or 1
+        else:
+            vr_st = VoterRecord.objects.exclude(polling_station__isnull=True).exclude(polling_station='').values_list('polling_station', flat=True).distinct()
+            clean_set = set(clean_centre_name(s) for s in vr_st if s)
+            total_centres = len(clean_set) or 351
+
+        # Calculate targets based on scope
+        pillars_target = total_centres * 3
+        mobilizers_target = total_centres * 25
+
+        scope_desc = "All County (15 Wards)"
+        if eff_station:
+            scope_desc = f"{eff_station} Centre"
+        elif eff_ward:
+            scope_desc = f"{eff_ward} Ward"
+        elif eff_sc:
+            scope_desc = f"{eff_sc} Constituency"
 
         return response.Response({
-            'role_counts': counts,
-            'pillar_counts': pillar_counts,
-            'total_stations': total_stations,
-            'stations_with_coordinator': station_with_coord,
-            'targets_per_station': {
-                'pillars_target': 3,
-                'mobilizers_target': 25,
-                'coordinators_target': 1,
+            'scope_description': scope_desc,
+            'role_counts': {
+                'governor': gov_count,
+                'county_manager': cm_count,
+                'sub_county_coordinator': sc_count,
+                'ward_coordinator': ward_count,
+                'polling_centre_coordinator': pcc_count,
+                'pillar': pillar_count,
+                'station_mobilizer': mob_count,
+                'total_personnel': qs.count(),
+            },
+            'targets': {
+                'pillars_target': pillars_target,
+                'mobilizers_target': mobilizers_target,
+                'total_centres': total_centres,
+            },
+            'pillar_counts': {
+                'youth': qs.filter(campaign_role='pillar', pillar_category='youth').count(),
+                'women': qs.filter(campaign_role='pillar', pillar_category='women').count(),
+                'elders_business': qs.filter(campaign_role='pillar', pillar_category='elders_business').count(),
+                'special_interest': qs.filter(campaign_role='pillar', pillar_category='special_interest').count(),
             }
         })
 
@@ -2396,93 +2605,213 @@ class CampaignHierarchyStatsView(views.APIView):
 class CampaignHierarchyTreeView(views.APIView):
     """
     Returns the hierarchy tree structured by Ward -> Polling Centre -> [Coordinator, 3 Pillars, 25 Mobilizers].
+    Auto-scopes based on authenticated coordinator role:
+    - County Manager / Governor: County-wide (all 15 wards) or filtered constituency/ward
+    - Sub-County Coordinator: All Wards in their assigned Constituency
+    - Ward Coordinator: Their assigned Ward
+    - Polling Centre Coordinator: Their assigned Centre
     """
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
+        user = request.user
+        is_super = getattr(user, 'is_admin', False) or getattr(user, 'is_staff', False) or getattr(user, 'is_superuser', False) or getattr(user, 'campaign_role', '') in ['governor', 'county_manager']
+        
+        user_role = getattr(user, 'campaign_role', 'station_mobilizer')
+        user_sc = getattr(user, 'assigned_sub_county', '') or ''
+        user_ward = getattr(user, 'assigned_ward', '') or getattr(user, 'ward', '') or ''
+        user_station = clean_centre_name(getattr(user, 'assigned_polling_centre', '') or getattr(user, 'polling_station', '') or '')
+        
+        req_sc = request.query_params.get('sub_county', '').strip()
         ward_filter = request.query_params.get('ward', '').strip()
-        search_query = request.query_params.get('search', '').strip()
+        station_filter = clean_centre_name(request.query_params.get('station', '').strip())
+        
+        allowed_wards = []
+        eff_sc = None
 
-        # Collect all active personnel
-        qs = Member.objects.filter(is_active=True)
+        if is_super:
+            if req_sc:
+                eff_sc = req_sc
+                allowed_wards = get_jurisdiction_wards(sub_county=req_sc)
+        elif user_role == 'sub_county_coordinator' and user_sc:
+            eff_sc = user_sc
+            allowed_wards = get_jurisdiction_wards(sub_county=user_sc)
+        elif user_role == 'ward_coordinator' and user_ward:
+            allowed_wards = [user_ward]
+            eff_sc = user_sc or WARD_TO_SUBCOUNTY.get(user_ward.lower(), '')
+        elif user_ward:
+            allowed_wards = [user_ward]
+            eff_sc = user_sc or WARD_TO_SUBCOUNTY.get(user_ward.lower(), '')
+
+        # Distinct Wards (Official 15 Wards in Canonical Order)
+        raw_db_wards = list(VoterRecord.objects.exclude(ward__isnull=True).exclude(ward='').exclude(ward__iexact='prisons').values_list('ward', flat=True).distinct())
+        if not raw_db_wards:
+            raw_db_wards = list(Member.objects.exclude(ward__isnull=True).exclude(ward='').exclude(ward__iexact='prisons').values_list('ward', flat=True).distinct())
+        
+        all_db_wards = []
+        for aw in ALL_LAIKIPIA_WARDS:
+            norm_aw = aw.lower().replace('mukogodo', 'mugogodo')
+            match = next((w for w in raw_db_wards if w.lower().replace('mukogodo', 'mugogodo') == norm_aw), None)
+            if match and match not in all_db_wards:
+                all_db_wards.append(match)
+        for w in raw_db_wards:
+            if w not in all_db_wards and w.lower() != 'prisons':
+                all_db_wards.append(w)
+
         if ward_filter:
-            qs = qs.filter(Q(assigned_ward=ward_filter) | Q(ward=ward_filter))
-        if search_query:
-            qs = qs.filter(Q(full_name__icontains=search_query) | Q(phone__icontains=search_query) | Q(national_id__icontains=search_query))
-
-        # Distinct Wards
-        wards_data = []
-        ward_names = VoterRecord.objects.exclude(ward__isnull=True).exclude(ward='').values_list('ward', flat=True).distinct().order_by('ward')
-        if not ward_names.exists():
-            ward_names = Member.objects.exclude(ward__isnull=True).exclude(ward='').values_list('ward', flat=True).distinct().order_by('ward')
-
-        if ward_filter:
-            ward_names = [w for w in ward_names if w.lower() == ward_filter.lower()]
+            if allowed_wards and ward_filter.lower() not in [aw.lower() for aw in allowed_wards] and not is_super:
+                ward_names = [w for w in all_db_wards if w.lower() in [aw.lower() for aw in allowed_wards]]
+            else:
+                ward_names = [w for w in all_db_wards if w.lower() == ward_filter.lower()]
+                if not ward_names:
+                    ward_names = [ward_filter]
+        elif allowed_wards:
+            ward_names = [w for w in all_db_wards if w.lower() in [aw.lower() for aw in allowed_wards]]
             if not ward_names:
-                ward_names = [ward_filter]
+                ward_names = allowed_wards
+        else:
+            ward_names = all_db_wards
 
+        # ─── HIGH-PERFORMANCE SINGLE BULK QUERY (PREVENTS 502 DOWNTIME) ─────
+        relevant_members = list(
+            Member.objects.filter(is_active=True)
+            .filter(
+                Q(campaign_role__in=['governor', 'county_manager', 'sub_county_coordinator']) |
+                Q(assigned_ward__in=ward_names) | Q(ward__in=ward_names) | Q(official_ward__in=ward_names)
+            )
+            .select_related('supervisor')
+            .order_by('created_at')
+        )
+
+        # In-memory fast indexing
+        ward_coords_map = {}
+        centre_coords_map = {}
+        pillars_map = {}
+        mobilizers_map = {}
+        gov_list = []
+        cm_list = []
+        sc_list = []
+
+        for m in relevant_members:
+            role = m.campaign_role
+            if role == 'governor':
+                gov_list.append(m)
+            elif role == 'county_manager':
+                cm_list.append(m)
+            elif role == 'sub_county_coordinator':
+                if not eff_sc or (m.assigned_sub_county and m.assigned_sub_county.lower() == eff_sc.lower()):
+                    sc_list.append(m)
+            elif role == 'ward_coordinator':
+                for wk in [m.assigned_ward, m.ward, m.official_ward]:
+                    if wk:
+                        norm_wk = wk.lower().strip().replace('mukogodo', 'mugogodo')
+                        if norm_wk not in ward_coords_map:
+                            ward_coords_map[norm_wk] = m
+            elif role == 'polling_centre_coordinator':
+                for sk in [m.assigned_polling_centre, m.polling_station]:
+                    if sk:
+                        norm_sk = clean_centre_name(sk).lower().strip()
+                        if norm_sk not in centre_coords_map:
+                            centre_coords_map[norm_sk] = m
+            elif role == 'pillar':
+                for sk in [m.assigned_polling_centre, m.polling_station]:
+                    if sk:
+                        norm_sk = clean_centre_name(sk).lower().strip()
+                        if norm_sk not in pillars_map:
+                            pillars_map[norm_sk] = []
+                        if m not in pillars_map[norm_sk]:
+                            pillars_map[norm_sk].append(m)
+            elif role in ['station_mobilizer', '', None]:
+                for sk in [m.assigned_polling_centre, m.polling_station]:
+                    if sk:
+                        norm_sk = clean_centre_name(sk).lower().strip()
+                        if norm_sk not in mobilizers_map:
+                            mobilizers_map[norm_sk] = []
+                        if m not in mobilizers_map[norm_sk]:
+                            mobilizers_map[norm_sk].append(m)
+
+        # Bulk load voter stations for all active wards in 1 query
+        vr_stations_qs = list(
+            VoterRecord.objects.filter(ward__in=ward_names)
+            .exclude(polling_station__isnull=True)
+            .exclude(polling_station='')
+            .values('ward', 'polling_station')
+            .distinct()
+        )
+
+        ward_to_stations = {}
+        for row in vr_stations_qs:
+            w_norm = row['ward'].lower().strip().replace('mukogodo', 'mugogodo')
+            if w_norm not in ward_to_stations:
+                ward_to_stations[w_norm] = set()
+            ward_to_stations[w_norm].add(row['polling_station'])
+
+        wards_data = []
         for w_name in ward_names:
-            ward_coord = Member.objects.filter(
-                campaign_role='ward_coordinator',
-                assigned_ward__iexact=w_name,
-                is_active=True
-            ).first()
+            w_norm = w_name.lower().strip().replace('mukogodo', 'mugogodo')
+            ward_coord = ward_coords_map.get(w_norm)
 
-            # Find polling stations in this ward
-            stations_in_ward = VoterRecord.objects.filter(ward__iexact=w_name).exclude(polling_station__isnull=True).exclude(polling_station='').values_list('polling_station', flat=True).distinct().order_by('polling_station')
-            if not stations_in_ward.exists():
-                stations_in_ward = Member.objects.filter(ward__iexact=w_name).exclude(polling_station__isnull=True).exclude(polling_station='').values_list('polling_station', flat=True).distinct().order_by('polling_station')
+            raw_stations = sorted(list(ward_to_stations.get(w_norm, set())))
+            if not raw_stations:
+                # fallback from members
+                raw_stations = sorted(list(set(
+                    (m.polling_station or m.assigned_polling_centre) for m in relevant_members
+                    if (m.assigned_ward or m.ward or '').lower().strip().replace('mukogodo', 'mugogodo') == w_norm and (m.polling_station or m.assigned_polling_centre)
+                )))
+
+            centres_map = {}
+            for s in raw_stations:
+                cleaned = clean_centre_name(s)
+                if cleaned not in centres_map:
+                    centres_map[cleaned] = []
+                centres_map[cleaned].append(s)
+
+            # Filter centres if station_filter is active or user is locked to station
+            active_station = station_filter or (user_station if user_role in ['polling_centre_coordinator', 'pillar', 'station_mobilizer'] else '')
+            if active_station:
+                centres_map = {k: v for k, v in centres_map.items() if clean_centre_name(k).lower() == clean_centre_name(active_station).lower()}
 
             stations_data = []
-            for s_name in stations_in_ward:
-                centre_coord = Member.objects.filter(
-                    campaign_role='polling_centre_coordinator',
-                    assigned_polling_centre__iexact=s_name,
-                    is_active=True
-                ).first()
+            for c_name, stream_list in sorted(centres_map.items()):
+                norm_c = clean_centre_name(c_name).lower().strip()
+                centre_coord = centre_coords_map.get(norm_c)
+                
+                # Also check stream aliases if any
+                if not centre_coord:
+                    for str_name in stream_list:
+                        centre_coord = centre_coords_map.get(clean_centre_name(str_name).lower().strip())
+                        if centre_coord:
+                            break
 
-                pillars = Member.objects.filter(
-                    campaign_role='pillar',
-                    assigned_polling_centre__iexact=s_name,
-                    is_active=True
-                ).order_by('created_at')[:3]
-
-                mobilizers = Member.objects.filter(
-                    Q(campaign_role='station_mobilizer') | Q(campaign_role=''),
-                    Q(assigned_polling_centre__iexact=s_name) | Q(polling_station__iexact=s_name),
-                    is_active=True
-                ).order_by('-created_at')[:25]
+                st_pillars = pillars_map.get(norm_c, [])[:3]
+                st_mobilizers = sorted(mobilizers_map.get(norm_c, []), key=lambda x: x.created_at, reverse=True)[:25]
 
                 stations_data.append({
-                    'polling_station': s_name,
+                    'polling_station': c_name,
+                    'streams_count': len(stream_list),
                     'ward': w_name,
-                    'coordinator': CampaignPersonnelSerializer(centre_coord).data if centre_coord else None,
-                    'pillars': CampaignPersonnelSerializer(pillars, many=True).data,
-                    'pillars_count': pillars.count(),
+                    'coordinator': CampaignPersonnelSerializer(centre_coord, context={'request': request}).data if centre_coord else None,
+                    'pillars': CampaignPersonnelSerializer(st_pillars, many=True, context={'request': request}).data,
+                    'pillars_count': len(st_pillars),
                     'pillars_target': 3,
-                    'mobilizers': CampaignPersonnelSerializer(mobilizers, many=True).data,
-                    'mobilizers_count': mobilizers.count(),
+                    'mobilizers': CampaignPersonnelSerializer(st_mobilizers, many=True, context={'request': request}).data,
+                    'mobilizers_count': len(st_mobilizers),
                     'mobilizers_target': 25,
-                    'is_quota_filled': (pillars.count() >= 3 and mobilizers.count() >= 25),
+                    'is_quota_filled': (len(st_pillars) >= 3 and len(st_mobilizers) >= 25),
                 })
 
             wards_data.append({
                 'ward': w_name,
-                'coordinator': CampaignPersonnelSerializer(ward_coord).data if ward_coord else None,
+                'coordinator': CampaignPersonnelSerializer(ward_coord, context={'request': request}).data if ward_coord else None,
                 'polling_stations': stations_data,
                 'total_stations': len(stations_data),
             })
 
-        # Top leadership
-        governors = Member.objects.filter(campaign_role='governor', is_active=True)
-        managers = Member.objects.filter(campaign_role='county_manager', is_active=True)
-        sub_county_coords = Member.objects.filter(campaign_role='sub_county_coordinator', is_active=True)
-
         return response.Response({
             'leadership': {
-                'governors': CampaignPersonnelSerializer(governors, many=True).data,
-                'county_managers': CampaignPersonnelSerializer(managers, many=True).data,
-                'sub_county_coordinators': CampaignPersonnelSerializer(sub_county_coords, many=True).data,
+                'governors': CampaignPersonnelSerializer(gov_list, many=True, context={'request': request}).data,
+                'county_managers': CampaignPersonnelSerializer(cm_list, many=True, context={'request': request}).data,
+                'sub_county_coordinators': CampaignPersonnelSerializer(sc_list, many=True, context={'request': request}).data,
             },
             'wards': wards_data
         })
@@ -2496,20 +2825,53 @@ class CampaignDirectoryView(views.APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
+        user = request.user
+        is_super = getattr(user, 'is_admin', False) or getattr(user, 'is_staff', False) or getattr(user, 'is_superuser', False) or getattr(user, 'campaign_role', '') in ['governor', 'county_manager']
+        user_role = getattr(user, 'campaign_role', 'station_mobilizer')
+        user_sc = getattr(user, 'assigned_sub_county', '') or ''
+        user_ward = getattr(user, 'assigned_ward', '') or getattr(user, 'ward', '') or ''
+        user_station = clean_centre_name(getattr(user, 'assigned_polling_centre', '') or getattr(user, 'polling_station', '') or '')
+
         role = request.query_params.get('role', '').strip()
+        sc = request.query_params.get('sub_county', '').strip()
         ward = request.query_params.get('ward', '').strip()
-        station = request.query_params.get('station', '').strip()
+        station = clean_centre_name(request.query_params.get('station', '').strip())
         category = request.query_params.get('pillar_category', '').strip()
         q = request.query_params.get('search', '').strip()
 
         members = Member.objects.filter(is_active=True)
 
+        if not is_super:
+            if user_role == 'sub_county_coordinator' and user_sc:
+                sc_wards = get_jurisdiction_wards(sub_county=user_sc)
+                members = members.filter(
+                    Q(assigned_sub_county__iexact=user_sc) | 
+                    Q(assigned_ward__in=sc_wards) | 
+                    Q(ward__in=sc_wards) | 
+                    Q(campaign_role__in=['governor', 'county_manager', 'sub_county_coordinator'])
+                )
+            elif user_role == 'ward_coordinator' and user_ward:
+                members = members.filter(
+                    Q(assigned_ward__iexact=user_ward) | 
+                    Q(ward__iexact=user_ward) | 
+                    Q(campaign_role__in=['governor', 'county_manager', 'sub_county_coordinator', 'ward_coordinator'])
+                )
+            elif user_role in ['polling_centre_coordinator', 'pillar'] and user_station:
+                members = members.filter(
+                    Q(assigned_polling_centre__iexact=user_station) | 
+                    Q(polling_station__iexact=user_station) | 
+                    Q(campaign_role__in=['governor', 'county_manager', 'sub_county_coordinator', 'ward_coordinator', 'polling_centre_coordinator'])
+                )
+
         if role:
             members = members.filter(campaign_role=role)
+        if sc:
+            sc_wards = get_jurisdiction_wards(sub_county=sc)
+            members = members.filter(Q(assigned_sub_county__iexact=sc) | Q(assigned_ward__in=sc_wards) | Q(ward__in=sc_wards) | Q(campaign_role__in=['governor', 'county_manager']))
         if ward:
-            members = members.filter(Q(assigned_ward__iexact=ward) | Q(ward__iexact=ward))
+            members = members.filter(Q(assigned_ward__iexact=ward) | Q(ward__iexact=ward) | Q(campaign_role__in=['governor', 'county_manager', 'sub_county_coordinator']))
         if station:
-            members = members.filter(Q(assigned_polling_centre__iexact=station) | Q(polling_station__iexact=station))
+            members = members.filter(Q(assigned_polling_centre__iexact=station) | Q(polling_station__iexact=station) | Q(campaign_role__in=['governor', 'county_manager', 'sub_county_coordinator', 'ward_coordinator']))
         if category:
             members = members.filter(pillar_category=category)
         if q:
@@ -2517,15 +2879,17 @@ class CampaignDirectoryView(views.APIView):
                 Q(full_name__icontains=q) | Q(phone__icontains=q) | Q(national_id__icontains=q)
             )
 
-        # Pagination or top 100
-        members = members.order_by('-created_at')[:150]
-        serializer = CampaignPersonnelSerializer(members, many=True)
+        # Order by Tier and Date
+        limit = 5000 if (request.query_params.get('export') in ['true', '1', 'all'] or is_super) else 500
+        members = members.order_by('-created_at')[:limit]
+        serializer = CampaignPersonnelSerializer(members, many=True, context={'request': request})
         return response.Response(serializer.data)
 
 
 class CampaignMyTeamView(views.APIView):
     """
-    Returns the direct team that the authenticated member directly manages.
+    Returns the direct team that the authenticated member directly manages,
+    PLUS their upward chain of command so they know who they report to.
     """
     permission_classes = [IsAuthenticated]
 
@@ -2533,57 +2897,71 @@ class CampaignMyTeamView(views.APIView):
         user = request.user
         role = getattr(user, 'campaign_role', 'station_mobilizer')
         is_admin_user = getattr(user, 'is_admin', False) or getattr(user, 'is_staff', False) or getattr(user, 'is_superuser', False)
+        user_sc = getattr(user, 'assigned_sub_county', '') or ''
+        user_ward = getattr(user, 'assigned_ward', '') or getattr(user, 'ward', '') or ''
+        user_station = clean_centre_name(getattr(user, 'assigned_polling_centre', '') or getattr(user, 'polling_station', '') or '')
 
+        # ─── Subordinates / Downline ──────────────────────────────────
         subordinates = []
         team_title = "My Direct Team"
         can_appoint = False
         allowed_roles_to_appoint = []
 
         if is_admin_user or role in ['governor', 'county_manager']:
-            team_title = "County Campaign Command"
+            team_title = "County Operations Command Roster"
             can_appoint = True
             allowed_roles_to_appoint = [
                 'county_manager', 'sub_county_coordinator', 'ward_coordinator',
                 'polling_centre_coordinator', 'pillar', 'station_mobilizer'
             ]
+            # Subordinates for County Command are Sub-County Coordinators and Ward Coordinators
             subordinates = Member.objects.filter(
-                Q(supervisor=user) | Q(campaign_role__in=['sub_county_coordinator', 'ward_coordinator']),
+                Q(supervisor=user) | Q(campaign_role__in=['sub_county_coordinator', 'ward_coordinator', 'county_manager']),
                 is_active=True
-            ).order_by('campaign_role', 'full_name')
+            ).exclude(id=user.id).order_by('campaign_role', 'full_name')
 
         elif role == 'sub_county_coordinator':
-            team_title = f"Sub-County Team: {user.assigned_sub_county or 'Assigned Sub-County'}"
+            sub_county = user_sc or 'Laikipia West'
+            team_title = f"Sub-County Team: {sub_county}"
             can_appoint = True
             allowed_roles_to_appoint = ['ward_coordinator', 'polling_centre_coordinator']
-            sub_county = user.assigned_sub_county or ''
+            wards = get_jurisdiction_wards(sub_county=sub_county)
             subordinates = Member.objects.filter(
-                Q(supervisor=user) | (Q(assigned_sub_county=sub_county) & Q(campaign_role='ward_coordinator')),
+                Q(supervisor=user) | 
+                (Q(assigned_ward__in=wards) & Q(campaign_role__in=['ward_coordinator', 'polling_centre_coordinator'])) |
+                (Q(assigned_sub_county__iexact=sub_county) & Q(campaign_role__in=['ward_coordinator', 'polling_centre_coordinator'])),
                 is_active=True
-            ).order_by('full_name')
+            ).exclude(id=user.id).order_by('campaign_role', 'full_name')
 
         elif role == 'ward_coordinator':
-            ward = user.assigned_ward or user.ward or ''
+            ward = user_ward
             team_title = f"Ward Team: {ward or 'Assigned Ward'}"
             can_appoint = True
             allowed_roles_to_appoint = ['polling_centre_coordinator', 'pillar', 'station_mobilizer']
             subordinates = Member.objects.filter(
-                Q(supervisor=user) | (Q(assigned_ward__iexact=ward) & Q(campaign_role='polling_centre_coordinator')),
+                (Q(supervisor=user) | Q(assigned_ward__iexact=ward) | Q(ward__iexact=ward) | Q(official_ward__iexact=ward)) & Q(campaign_role__in=['polling_centre_coordinator', 'pillar', 'station_mobilizer', 'field_mobilizer']),
                 is_active=True
-            ).order_by('assigned_polling_centre', 'full_name')
+            ).exclude(id=user.id).order_by('campaign_role', 'full_name')
 
         elif role == 'polling_centre_coordinator':
-            station = user.assigned_polling_centre or user.polling_station or ''
-            team_title = f"Polling Centre Team: {station}"
+            station = user_station
+            ward = user_ward
+            team_title = f"Polling Centre Team: {station or ward}"
             can_appoint = True
             allowed_roles_to_appoint = ['pillar', 'station_mobilizer']
+            cond = Q(supervisor=user) | Q(referred_by=user)
+            if station:
+                cond |= (Q(assigned_polling_centre__iexact=station) | Q(polling_station__iexact=station) | Q(official_polling_station__iexact=station))
+            elif ward:
+                cond |= (Q(assigned_ward__iexact=ward) | Q(ward__iexact=ward))
             subordinates = Member.objects.filter(
-                Q(supervisor=user) | (Q(assigned_polling_centre__iexact=station) & Q(campaign_role__in=['pillar', 'station_mobilizer'])),
+                cond & Q(campaign_role__in=['pillar', 'station_mobilizer', 'field_mobilizer', 'none']),
                 is_active=True
-            ).order_by('campaign_role', 'full_name')
+            ).exclude(id=user.id).order_by('campaign_role', 'full_name')
 
         elif role == 'pillar':
-            station = user.assigned_polling_centre or user.polling_station or ''
-            team_title = f"{user.get_pillar_category_display() if hasattr(user, 'get_pillar_category_display') else 'Pillar'} - Station Mobilizers"
+            station = user_station
+            team_title = f"Pillar Station Mobilizers ({station})"
             can_appoint = False
             subordinates = Member.objects.filter(
                 Q(assigned_polling_centre__iexact=station) & Q(campaign_role='station_mobilizer'),
@@ -2602,20 +2980,19 @@ class CampaignMyTeamView(views.APIView):
             'can_appoint': can_appoint,
             'allowed_roles_to_appoint': allowed_roles_to_appoint,
             'team_count': subordinates.count() if hasattr(subordinates, 'count') else len(subordinates),
-            'members': CampaignPersonnelSerializer(subordinates, many=True).data
+                        'members': CampaignPersonnelSerializer(subordinates, many=True, context={'request': request}).data
         })
 
 
 class CampaignAssignRoleView(views.APIView):
     """
     Assigns or updates a member's campaign role and jurisdiction.
-    Enforces strict cascading command hierarchy:
-    - Super Admin / Governor / County Manager: County-wide authority to appoint anyone to any level.
-    - Sub-County Coordinator: Can appoint Ward Coordinators & Polling Centre Coordinators in their Sub-County.
-    - Ward Coordinator: Can appoint Polling Centre Coordinators, Pillars, and Mobilizers in their Ward.
-    - Polling Centre Coordinator: Can appoint 3 Pillars and 25 Mobilizers for their Polling Centre.
-
-    Auto-locks the appointee's jurisdiction to their verified IEBC registration data.
+    Enforces strict cascading command hierarchy & automatic IEBC registration check:
+    - If assigned as Sub-County Coordinator: System checks which Sub-County they are registered in and sets jurisdiction to that Sub-County.
+    - If assigned as Ward Coordinator: System checks which Ward they are registered in and sets jurisdiction to that Ward.
+    - If assigned as Polling Centre Coordinator: System checks which Polling Centre they are registered in and sets jurisdiction to that Centre.
+    - If assigned as Campaign Pillar / Mobilizer: System binds them to their registered Polling Centre.
+    - Super Admin / Governor / County Manager: County-wide authority.
     """
     permission_classes = [IsAuthenticated]
 
@@ -2672,17 +3049,22 @@ class CampaignAssignRoleView(views.APIView):
                 status=status.HTTP_404_NOT_FOUND
             )
 
-        # Candidate's verified IEBC location data
-        iebc_ward = (member.official_ward or member.ward or '').strip()
-        iebc_station = (member.official_polling_station or member.polling_station or '').strip()
-        iebc_subcounty = self.WARD_TO_SUBCOUNTY.get(iebc_ward.lower(), '') if iebc_ward else ''
+        # 1. Lookup Authoritative Voter Registration
+        voter = None
+        if member.national_id:
+            voter = VoterRecord.objects.filter(id_number=member.national_id).first()
+        if not voter and member.phone:
+            voter = VoterRecord.objects.filter(phone_number=member.phone).first()
 
-        # Determine target jurisdiction (Defaults automatically to their IEBC registered location)
-        sub_county = custom_sub_county or iebc_subcounty or getattr(member, 'assigned_sub_county', '')
-        ward = custom_ward or iebc_ward or getattr(member, 'assigned_ward', '')
-        station = custom_station or iebc_station or getattr(member, 'assigned_polling_centre', '')
+        reg_ward = (voter.ward if voter and voter.ward else (member.official_ward or member.ward or '')).strip()
+        reg_station_raw = (voter.polling_station if voter and voter.polling_station else (member.official_polling_station or member.polling_station or '')).strip()
+        reg_station = clean_centre_name(reg_station_raw) if reg_station_raw else ''
+        reg_subcounty = self.WARD_TO_SUBCOUNTY.get(reg_ward.lower(), '') if reg_ward else ''
 
-        # ─── Strict Cascading Authority Enforcement ────────────────────────────
+        if not reg_subcounty and member.assigned_sub_county:
+            reg_subcounty = member.assigned_sub_county
+
+        # 2. Enforce Strict Cascading Authority Permissions
         if not is_caller_admin and caller_role not in ['governor', 'county_manager']:
             if caller_role == 'sub_county_coordinator':
                 caller_sc = (caller.assigned_sub_county or self.WARD_TO_SUBCOUNTY.get((caller.assigned_ward or caller.ward or '').lower(), '')).strip()
@@ -2691,14 +3073,12 @@ class CampaignAssignRoleView(views.APIView):
                         {"error": "Sub-County Coordinators can only appoint Ward Coordinators or Polling Centre Coordinators."},
                         status=status.HTTP_403_FORBIDDEN
                     )
-                # Verify candidate is in caller's Sub-County
-                candidate_sc = iebc_subcounty or sub_county
+                candidate_sc = reg_subcounty or custom_sub_county
                 if candidate_sc and caller_sc and candidate_sc.lower() != caller_sc.lower():
                     return response.Response(
-                        {"error": f"Access Denied: Candidate's IEBC Sub-County ({candidate_sc}) does not match your assigned Sub-County ({caller_sc})."},
+                        {"error": f"Access Denied: Candidate's registered Sub-County ({candidate_sc}) does not match your assigned Sub-County ({caller_sc})."},
                         status=status.HTTP_403_FORBIDDEN
                     )
-                sub_county = caller_sc
 
             elif caller_role == 'ward_coordinator':
                 caller_ward = (caller.assigned_ward or caller.ward or '').strip()
@@ -2707,34 +3087,27 @@ class CampaignAssignRoleView(views.APIView):
                         {"error": "Ward Coordinators can only appoint Polling Centre Coordinators, Pillars, or Mobilizers."},
                         status=status.HTTP_403_FORBIDDEN
                     )
-                # Candidate MUST be registered in caller's Ward
-                candidate_ward = iebc_ward or ward
+                candidate_ward = reg_ward or custom_ward
                 if candidate_ward and caller_ward and candidate_ward.lower() != caller_ward.lower():
                     return response.Response(
                         {"error": f"Access Denied: Candidate is registered in {candidate_ward} Ward, but you are the coordinator for {caller_ward} Ward."},
                         status=status.HTTP_403_FORBIDDEN
                     )
-                ward = caller_ward
-                sub_county = self.WARD_TO_SUBCOUNTY.get(ward.lower(), sub_county)
 
             elif caller_role == 'polling_centre_coordinator':
-                caller_station = (caller.assigned_polling_centre or caller.polling_station or '').strip()
+                caller_station = clean_centre_name(caller.assigned_polling_centre or caller.polling_station or '')
                 caller_ward = (caller.assigned_ward or caller.ward or '').strip()
                 if new_role not in ['pillar', 'station_mobilizer']:
                     return response.Response(
                         {"error": "Polling Centre Coordinators can only appoint their 3 Pillars or 25 Mobilizers."},
                         status=status.HTTP_403_FORBIDDEN
                     )
-                # Candidate MUST be registered in caller's Polling Centre
-                candidate_station = iebc_station or station
+                candidate_station = reg_station or clean_centre_name(custom_station)
                 if candidate_station and caller_station and candidate_station.lower() != caller_station.lower():
                     return response.Response(
                         {"error": f"Access Denied: Candidate is registered at '{candidate_station}', but you manage '{caller_station}'."},
                         status=status.HTTP_403_FORBIDDEN
                     )
-                station = caller_station
-                ward = caller_ward
-                sub_county = self.WARD_TO_SUBCOUNTY.get(ward.lower(), sub_county)
 
             else:
                 return response.Response(
@@ -2742,27 +3115,51 @@ class CampaignAssignRoleView(views.APIView):
                     status=status.HTTP_403_FORBIDDEN
                 )
 
-        # Role-specific jurisdiction bindings
-        if new_role == 'ward_coordinator':
-            if not ward and iebc_ward:
-                ward = iebc_ward
-            if not sub_county and ward:
-                sub_county = self.WARD_TO_SUBCOUNTY.get(ward.lower(), '')
+        # 3. Precise Role & Location Binding
+        final_sc = None
+        final_ward = None
+        final_station = None
+
+        if new_role == 'sub_county_coordinator':
+            # Uses explicitly assigned Sub-County, or auto-detects from voter registration
+            final_sc = custom_sub_county or reg_subcounty or member.assigned_sub_county
+            final_ward = custom_ward or reg_ward or member.assigned_ward
+            final_station = clean_centre_name(custom_station) or reg_station or member.assigned_polling_centre
+
+        elif new_role == 'ward_coordinator':
+            # Uses explicitly assigned Ward, or auto-detects from voter registration
+            final_ward = custom_ward or reg_ward or member.assigned_ward
+            final_sc = self.WARD_TO_SUBCOUNTY.get((final_ward or '').lower(), '') or custom_sub_county or reg_subcounty
+            final_station = clean_centre_name(custom_station) or reg_station or member.assigned_polling_centre
 
         elif new_role == 'polling_centre_coordinator':
-            if not station and iebc_station:
-                station = iebc_station
-            if not ward and iebc_ward:
-                ward = iebc_ward
-            if not sub_county and ward:
-                sub_county = self.WARD_TO_SUBCOUNTY.get(ward.lower(), '')
+            # Uses explicitly assigned Polling Centre, or auto-detects from voter registration
+            final_station = clean_centre_name(custom_station) or reg_station or member.assigned_polling_centre
+            final_ward = custom_ward or reg_ward or member.assigned_ward
+            final_sc = self.WARD_TO_SUBCOUNTY.get((final_ward or '').lower(), '') or custom_sub_county or reg_subcounty
 
-        # Quota Validation Checks
+        elif new_role in ['pillar', 'station_mobilizer']:
+            final_station = clean_centre_name(custom_station) or reg_station or member.assigned_polling_centre
+            final_ward = custom_ward or reg_ward or member.assigned_ward
+            final_sc = self.WARD_TO_SUBCOUNTY.get((final_ward or '').lower(), '') if final_ward else (reg_subcounty or custom_sub_county)
+
+        elif new_role in ['governor', 'county_manager']:
+            final_sc = None
+            final_ward = None
+            final_station = None
+            member.is_admin = True
+            member.is_staff = True
+
+        # Clear any stale polling agent assignments upon leadership elevation
+        if hasattr(member, 'agent_assignments'):
+            member.agent_assignments.all().delete()
+
+        # 4. Quota Validation Checks
         if new_role == 'pillar':
-            target_station = station or iebc_station
+            target_station = final_station or reg_station
             if not target_station:
                 return response.Response(
-                    {"error": "Assigned Polling Centre / IEBC Polling Station is required for a Campaign Pillar."},
+                    {"error": "Assigned Polling Centre is required for a Campaign Pillar."},
                     status=status.HTTP_400_BAD_REQUEST
                 )
             if pillar_category not in ['youth', 'women', 'elders_business', 'special_interest']:
@@ -2772,8 +3169,9 @@ class CampaignAssignRoleView(views.APIView):
                 )
             current_pillars = Member.objects.filter(
                 campaign_role='pillar',
-                assigned_polling_centre__iexact=target_station,
                 is_active=True
+            ).filter(
+                Q(assigned_polling_centre__iexact=target_station) | Q(polling_station__iexact=target_station)
             ).exclude(id=member.id)
             if current_pillars.count() >= 3:
                 return response.Response(
@@ -2784,12 +3182,13 @@ class CampaignAssignRoleView(views.APIView):
                 )
 
         if new_role == 'station_mobilizer':
-            target_station = station or iebc_station
+            target_station = final_station or reg_station
             if target_station:
                 current_mobs = Member.objects.filter(
                     campaign_role='station_mobilizer',
-                    assigned_polling_centre__iexact=target_station,
                     is_active=True
+                ).filter(
+                    Q(assigned_polling_centre__iexact=target_station) | Q(polling_station__iexact=target_station)
                 ).exclude(id=member.id)
                 if current_mobs.count() >= 25:
                     return response.Response(
@@ -2800,25 +3199,28 @@ class CampaignAssignRoleView(views.APIView):
                         status=status.HTTP_400_BAD_REQUEST
                     )
 
-        # Update member
+        # 5. Apply Updates to Member
         member.campaign_role = new_role
-        if sub_county:
-            member.assigned_sub_county = sub_county
-        if ward:
-            member.assigned_ward = ward
-        if station:
-            member.assigned_polling_centre = station
+        member.source = 'field_mobilizer'
+        member.referred_by = None  # Elevates to independent leader status
+        member.assigned_sub_county = final_sc
+        member.assigned_ward = final_ward
+        member.assigned_polling_centre = final_station
+
+        if reg_ward:
+            member.ward = reg_ward
+            member.official_ward = reg_ward
+        if reg_station:
+            member.polling_station = reg_station
+            member.official_polling_station = reg_station_raw or reg_station
+        if voter:
+            member.is_voter_verified = True
+
         if pillar_category:
             member.pillar_category = pillar_category
 
-        # Set supervisor to caller if not set
-        if not member.supervisor and request.user.id != member.id:
+        if not member.supervisor and request.user.id != member.id and not is_caller_admin:
             member.supervisor = request.user
-
-        # If appointed as Governor or County Manager, grant admin privileges
-        if new_role in ['governor', 'county_manager']:
-            member.is_admin = True
-            member.is_staff = True
 
         member.save()
 
@@ -2837,9 +3239,10 @@ class CampaignAssignRoleView(views.APIView):
             }
         )
 
+        jurisdiction_desc = member.assigned_polling_centre or member.assigned_ward or member.assigned_sub_county or 'County Wide'
         return response.Response({
             "status": "success",
-            "message": f"Successfully assigned {member.full_name} as {member.get_campaign_role_display()} for {member.assigned_ward or member.assigned_sub_county or 'County'}.",
+            "message": f"Successfully assigned {member.full_name} as {member.get_campaign_role_display()} ({jurisdiction_desc}).",
             "member": CampaignPersonnelSerializer(member).data
         })
 
