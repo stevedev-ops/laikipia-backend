@@ -235,7 +235,8 @@ MEMBERS_SEED = [
         'ward': 'Salama',
         'polling_station': 'Marura Primary School (Station 03)',
         'source': 'field_mobilizer',
-        'volunteer_role': 'General Supporter',
+        'campaign_role': 'governor',
+        'volunteer_role': 'Governor Aspirant',
         'is_voter_verified': True,
     },
     {
