@@ -2672,19 +2672,92 @@ class CampaignHierarchyTreeView(views.APIView):
         else:
             ward_names = all_db_wards
 
+        # ─── HIGH-PERFORMANCE SINGLE BULK QUERY (PREVENTS 502 DOWNTIME) ─────
+        relevant_members = list(
+            Member.objects.filter(is_active=True)
+            .filter(
+                Q(campaign_role__in=['governor', 'county_manager', 'sub_county_coordinator']) |
+                Q(assigned_ward__in=ward_names) | Q(ward__in=ward_names) | Q(official_ward__in=ward_names)
+            )
+            .select_related('supervisor')
+            .order_by('created_at')
+        )
+
+        # In-memory fast indexing
+        ward_coords_map = {}
+        centre_coords_map = {}
+        pillars_map = {}
+        mobilizers_map = {}
+        gov_list = []
+        cm_list = []
+        sc_list = []
+
+        for m in relevant_members:
+            role = m.campaign_role
+            if role == 'governor':
+                gov_list.append(m)
+            elif role == 'county_manager':
+                cm_list.append(m)
+            elif role == 'sub_county_coordinator':
+                if not eff_sc or (m.assigned_sub_county and m.assigned_sub_county.lower() == eff_sc.lower()):
+                    sc_list.append(m)
+            elif role == 'ward_coordinator':
+                for wk in [m.assigned_ward, m.ward, m.official_ward]:
+                    if wk:
+                        norm_wk = wk.lower().strip().replace('mukogodo', 'mugogodo')
+                        if norm_wk not in ward_coords_map:
+                            ward_coords_map[norm_wk] = m
+            elif role == 'polling_centre_coordinator':
+                for sk in [m.assigned_polling_centre, m.polling_station]:
+                    if sk:
+                        norm_sk = clean_centre_name(sk).lower().strip()
+                        if norm_sk not in centre_coords_map:
+                            centre_coords_map[norm_sk] = m
+            elif role == 'pillar':
+                for sk in [m.assigned_polling_centre, m.polling_station]:
+                    if sk:
+                        norm_sk = clean_centre_name(sk).lower().strip()
+                        if norm_sk not in pillars_map:
+                            pillars_map[norm_sk] = []
+                        if m not in pillars_map[norm_sk]:
+                            pillars_map[norm_sk].append(m)
+            elif role in ['station_mobilizer', '', None]:
+                for sk in [m.assigned_polling_centre, m.polling_station]:
+                    if sk:
+                        norm_sk = clean_centre_name(sk).lower().strip()
+                        if norm_sk not in mobilizers_map:
+                            mobilizers_map[norm_sk] = []
+                        if m not in mobilizers_map[norm_sk]:
+                            mobilizers_map[norm_sk].append(m)
+
+        # Bulk load voter stations for all active wards in 1 query
+        vr_stations_qs = list(
+            VoterRecord.objects.filter(ward__in=ward_names)
+            .exclude(polling_station__isnull=True)
+            .exclude(polling_station='')
+            .values('ward', 'polling_station')
+            .distinct()
+        )
+
+        ward_to_stations = {}
+        for row in vr_stations_qs:
+            w_norm = row['ward'].lower().strip().replace('mukogodo', 'mugogodo')
+            if w_norm not in ward_to_stations:
+                ward_to_stations[w_norm] = set()
+            ward_to_stations[w_norm].add(row['polling_station'])
+
         wards_data = []
         for w_name in ward_names:
-            ward_coord = Member.objects.filter(
-                campaign_role='ward_coordinator',
-                is_active=True
-            ).filter(
-                Q(assigned_ward__iexact=w_name) | Q(ward__iexact=w_name) | Q(official_ward__iexact=w_name)
-            ).first()
+            w_norm = w_name.lower().strip().replace('mukogodo', 'mugogodo')
+            ward_coord = ward_coords_map.get(w_norm)
 
-            # Find all station streams in this ward and group into unified Polling Centres
-            raw_stations = list(VoterRecord.objects.filter(ward__iexact=w_name).exclude(polling_station__isnull=True).exclude(polling_station='').values_list('polling_station', flat=True).distinct().order_by('polling_station'))
+            raw_stations = sorted(list(ward_to_stations.get(w_norm, set())))
             if not raw_stations:
-                raw_stations = list(Member.objects.filter(Q(assigned_ward__iexact=w_name) | Q(ward__iexact=w_name)).exclude(polling_station__isnull=True).exclude(polling_station='').values_list('polling_station', flat=True).distinct().order_by('polling_station'))
+                # fallback from members
+                raw_stations = sorted(list(set(
+                    (m.polling_station or m.assigned_polling_centre) for m in relevant_members
+                    if (m.assigned_ward or m.ward or '').lower().strip().replace('mukogodo', 'mugogodo') == w_norm and (m.polling_station or m.assigned_polling_centre)
+                )))
 
             centres_map = {}
             for s in raw_stations:
@@ -2696,52 +2769,35 @@ class CampaignHierarchyTreeView(views.APIView):
             # Filter centres if station_filter is active or user is locked to station
             active_station = station_filter or (user_station if user_role in ['polling_centre_coordinator', 'pillar', 'station_mobilizer'] else '')
             if active_station:
-                centres_map = {k: v for k, v in centres_map.items() if k.lower() == active_station.lower()}
+                centres_map = {k: v for k, v in centres_map.items() if clean_centre_name(k).lower() == clean_centre_name(active_station).lower()}
 
             stations_data = []
             for c_name, stream_list in sorted(centres_map.items()):
-                centre_coord = Member.objects.filter(
-                    campaign_role='polling_centre_coordinator',
-                    is_active=True
-                ).filter(
-                    Q(assigned_polling_centre__iexact=c_name) |
-                    Q(assigned_polling_centre__in=stream_list) |
-                    Q(polling_station__iexact=c_name) |
-                    Q(polling_station__in=stream_list)
-                ).first()
+                norm_c = clean_centre_name(c_name).lower().strip()
+                centre_coord = centre_coords_map.get(norm_c)
+                
+                # Also check stream aliases if any
+                if not centre_coord:
+                    for str_name in stream_list:
+                        centre_coord = centre_coords_map.get(clean_centre_name(str_name).lower().strip())
+                        if centre_coord:
+                            break
 
-                pillars = Member.objects.filter(
-                    campaign_role='pillar',
-                    is_active=True
-                ).filter(
-                    Q(assigned_polling_centre__iexact=c_name) |
-                    Q(assigned_polling_centre__in=stream_list) |
-                    Q(polling_station__iexact=c_name) |
-                    Q(polling_station__in=stream_list)
-                ).order_by('created_at')[:3]
-
-                mobilizers = Member.objects.filter(
-                    Q(campaign_role='station_mobilizer') | Q(campaign_role='') | Q(campaign_role__isnull=True),
-                    is_active=True
-                ).filter(
-                    Q(assigned_polling_centre__iexact=c_name) |
-                    Q(assigned_polling_centre__in=stream_list) |
-                    Q(polling_station__iexact=c_name) |
-                    Q(polling_station__in=stream_list)
-                ).order_by('-created_at')[:25]
+                st_pillars = pillars_map.get(norm_c, [])[:3]
+                st_mobilizers = sorted(mobilizers_map.get(norm_c, []), key=lambda x: x.created_at, reverse=True)[:25]
 
                 stations_data.append({
                     'polling_station': c_name,
                     'streams_count': len(stream_list),
                     'ward': w_name,
                     'coordinator': CampaignPersonnelSerializer(centre_coord, context={'request': request}).data if centre_coord else None,
-                    'pillars': CampaignPersonnelSerializer(pillars, many=True, context={'request': request}).data,
-                    'pillars_count': pillars.count(),
+                    'pillars': CampaignPersonnelSerializer(st_pillars, many=True, context={'request': request}).data,
+                    'pillars_count': len(st_pillars),
                     'pillars_target': 3,
-                    'mobilizers': CampaignPersonnelSerializer(mobilizers, many=True, context={'request': request}).data,
-                    'mobilizers_count': mobilizers.count(),
+                    'mobilizers': CampaignPersonnelSerializer(st_mobilizers, many=True, context={'request': request}).data,
+                    'mobilizers_count': len(st_mobilizers),
                     'mobilizers_target': 25,
-                    'is_quota_filled': (pillars.count() >= 3 and mobilizers.count() >= 25),
+                    'is_quota_filled': (len(st_pillars) >= 3 and len(st_mobilizers) >= 25),
                 })
 
             wards_data.append({
@@ -2751,20 +2807,11 @@ class CampaignHierarchyTreeView(views.APIView):
                 'total_stations': len(stations_data),
             })
 
-        # Top leadership (scoped to constituency if filtered)
-        governors = Member.objects.filter(campaign_role='governor', is_active=True)
-        managers = Member.objects.filter(campaign_role='county_manager', is_active=True)
-        
-        sc_qs = Member.objects.filter(campaign_role='sub_county_coordinator', is_active=True)
-        if eff_sc:
-            sc_qs = sc_qs.filter(assigned_sub_county__iexact=eff_sc)
-        sub_county_coords = sc_qs
-
         return response.Response({
             'leadership': {
-                'governors': CampaignPersonnelSerializer(governors, many=True, context={'request': request}).data,
-                'county_managers': CampaignPersonnelSerializer(managers, many=True, context={'request': request}).data,
-                'sub_county_coordinators': CampaignPersonnelSerializer(sub_county_coords, many=True, context={'request': request}).data,
+                'governors': CampaignPersonnelSerializer(gov_list, many=True, context={'request': request}).data,
+                'county_managers': CampaignPersonnelSerializer(cm_list, many=True, context={'request': request}).data,
+                'sub_county_coordinators': CampaignPersonnelSerializer(sc_list, many=True, context={'request': request}).data,
             },
             'wards': wards_data
         })
