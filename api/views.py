@@ -238,18 +238,26 @@ class MemberRegisterView(views.APIView):
             }, status=status.HTTP_409_CONFLICT)
 
         # 3. Check Voter Register with enhanced matching FIRST
-        national_id = data.get('national_id', '')
-        phone = data.get('phone', '')
-        full_name = data.get('full_name', '')
+        national_id = str(data.get('national_id', '')).strip()
+        phone = str(data.get('phone', '')).strip()
+        full_name = str(data.get('full_name', '')).strip()
+        voter_record_id = data.get('voter_record_id')
         matched_record = None
 
-        # Direct match first
-        direct = VoterRecord.objects.filter(
-            Q(id_number=national_id) | Q(phone_number=phone)
-        ).first()
-        
-        if direct:
-            matched_record = direct
+        # If frontend passed the picked voter record ID directly, use it
+        if voter_record_id:
+            try:
+                matched_record = VoterRecord.objects.filter(id=int(voter_record_id)).first()
+            except (ValueError, TypeError):
+                matched_record = None
+
+        # Direct match next if not yet matched
+        if not matched_record:
+            direct = VoterRecord.objects.filter(
+                Q(id_number=national_id) | Q(phone_number=phone)
+            ).first()
+            if direct:
+                matched_record = direct
 
         if not matched_record and national_id:
             # Try masked ID matching (checking first and last digits)
@@ -257,7 +265,10 @@ class MemberRegisterView(views.APIView):
             if id_len >= 5:
                 id_pattern = f"{national_id[0]}{'*' * (id_len - 2)}{national_id[-1]}"
                 name_parts = [p for p in full_name.upper().split(' ') if len(p) > 2]
-                potential_matches = list(VoterRecord.objects.filter(id_number=id_pattern))
+                potential_matches = list(VoterRecord.objects.filter(
+                    Q(id_number=id_pattern) |
+                    (Q(id_number__startswith=national_id[0]) & Q(id_number__endswith=national_id[-1]) & Q(id_number__contains='*'))
+                ))
 
                 # Pass 1: 2+ name parts
                 for record in potential_matches:
