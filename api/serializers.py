@@ -13,8 +13,9 @@ def mask_id(id_str):
     if not id_str:
         return "••••••••"
     nid = str(id_str).strip()
-    if len(nid) >= 4:
-        return ("*" * max(0, len(nid) - 2)) + nid[-2:]
+    if len(nid) >= 3:
+        # Preserve first and last character so public voter lookup can verify first and last digit
+        return nid[0] + ("*" * max(0, len(nid) - 2)) + nid[-1]
     return "••••••••"
 
 class MemberSerializer(serializers.ModelSerializer):
