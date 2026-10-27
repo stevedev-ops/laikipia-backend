@@ -209,17 +209,10 @@ class MemberRegisterView(views.APIView):
         data['is_staff'] = False
         data['is_superuser'] = False
 
-        # 1. Quota Check
+        # 1. Referrer Verification (Mobilizers can enroll unlimited members - no quota cap)
         if referrer_id and not invite_token:
             try:
                 referrer = Member.objects.get(id=referrer_id)
-                quota = 10 if referrer.referred_by is None else 5
-                current_count = referrer.recruits.count()
-                if current_count >= quota:
-                    return response.Response(
-                        {"error": f"Recruiter has reached their quota of {quota} members."},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
             except Member.DoesNotExist:
                 return response.Response({"error": "Invalid referrer."}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -680,6 +673,17 @@ class MemberDetailView(views.APIView):
 
         member.save()
         return response.Response(MemberSerializer(member, context={'request': request}).data)
+
+    def delete(self, request, pk):
+        try:
+            member = Member.objects.get(pk=pk)
+            if member.is_admin or member.is_staff:
+                return response.Response({"error": "Cannot delete admin account"}, status=status.HTTP_400_BAD_REQUEST)
+            member_name = member.full_name
+            member.delete()
+            return response.Response({"status": "deleted", "id": pk, "name": member_name}, status=status.HTTP_200_OK)
+        except Member.DoesNotExist:
+            return response.Response({"error": "Not found"}, status=status.HTTP_404_NOT_FOUND)
 
 class VoterRecordPagination(PageNumberPagination):
     page_size = 50
@@ -2427,13 +2431,7 @@ class MemberClaimSocialView(views.APIView):
                 "error": f"This member is already registered under Mobilizer {recruit.referred_by.full_name} and cannot be reassigned."
             }, status=status.HTTP_400_BAD_REQUEST)
 
-        # Check mobilizer quota
-        quota = 10 if mobilizer.referred_by is None else 5
-        current_count = mobilizer.recruits.count()
-        if current_count >= quota:
-            return response.Response({"error": f"You have reached your quota limit of {quota} recruits."}, status=status.HTTP_400_BAD_REQUEST)
-
-        # Assign recruit to this mobilizer
+        # Assign recruit to this mobilizer (unlimited enrolments allowed)
         recruit.referred_by = mobilizer
         recruit.save(update_fields=['referred_by'])
         AuditLog.log('RECRUIT_ADOPTED', user=mobilizer, request=request, details={

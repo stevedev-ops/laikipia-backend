@@ -17,7 +17,10 @@ def check_rate_limit(request, key_prefix, max_requests, window_seconds, extra_ke
     Sliding-window rate limiter backed by Django cache.
     Returns (is_allowed, remaining_requests, retry_after_seconds)
     """
+    from django.conf import settings
     ip = get_client_ip(request)
+    if getattr(settings, 'DEBUG', False) or ip in ('127.0.0.1', '::1', 'localhost'):
+        return True, max_requests, 0
     cache_key = f"rl:{key_prefix}:{ip}:{extra_key}"
     now = time.time()
     
