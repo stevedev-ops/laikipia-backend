@@ -674,6 +674,17 @@ class MemberDetailView(views.APIView):
         member.save()
         return response.Response(MemberSerializer(member, context={'request': request}).data)
 
+    def delete(self, request, pk):
+        try:
+            member = Member.objects.get(pk=pk)
+            if member.is_admin or member.is_staff:
+                return response.Response({"error": "Cannot delete admin account"}, status=status.HTTP_400_BAD_REQUEST)
+            member_name = member.full_name
+            member.delete()
+            return response.Response({"status": "deleted", "id": pk, "name": member_name}, status=status.HTTP_200_OK)
+        except Member.DoesNotExist:
+            return response.Response({"error": "Not found"}, status=status.HTTP_404_NOT_FOUND)
+
 class VoterRecordPagination(PageNumberPagination):
     page_size = 50
 
